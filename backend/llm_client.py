@@ -103,7 +103,12 @@ class LLMClient:
         """
         Identify BOTH positive and negative property preferences.
 
-        Returns {"positive": [...PPP keys...], "negative": [...NPP keys...]}.
+        The LLM is the sole authority on validity and polarity. We do NOT
+        constrain output to PPP_ENUM_FULL / NPP_ENUM_FULL — the existing
+        enums are passed only as hints / canonical naming examples so the
+        model prefers known keys when the concept matches.
+
+        Returns {"positive": [...tags...], "negative": [...tags...]}.
         On any failure returns {"positive": [], "negative": []}.
         """
         from positive_enum import PPP_ENUM_FULL
@@ -111,25 +116,42 @@ class LLMClient:
         # Escape description so embedded quotes don't break the prompt JSON
         safe_desc = json.dumps(description, ensure_ascii=False)
 
+        ppp_hint = list(PPP_ENUM_FULL.keys())
+        npp_hint = list(NPP_ENUM_FULL.keys())
+
         messages = [
             {
                 "role": "user",
                 "content": f"""
-從以下用戶輸入中同時識別「正面偏好」與「負面偏好」。
+你是一個房產偏好標籤分類器。從用戶輸入中同時識別「正面偏好（PPP）」與「負面偏好（NPP）」。
 
 用戶輸入：{safe_desc}
 
-規則：
-- 「我不要 X」「沒有 X」「避免 X」→ 放入 negative
-- 「我要 X」「必須有 X」「希望 X」「需要 X」→ 放入 positive
-- 同一語義若同時被否定與肯定（如 "no west-facing, need east-facing"），各取其對應極性的 tag
-- 只能使用以下白名單 tag（內部 key）
+# 極性判斷規則
+1. 顯式信號：
+   - 否定（→ negative）：「不要 / 沒有 / 避免 / 拒絕 / 不想 / no / without / avoid / dealbreaker」
+   - 肯定（→ positive）：「要 / 必須 / 希望 / 需要 / want / need / must have / prefer」
+2. 隱式信號：用戶輸入若為純名詞清單（如 "condo, east-facing, security"），
+   且上下文無法判斷，**預設視為 negative（dealbreakers）**，因為此欄位即「要避開的事項」。
+   一旦同一輸入中出現任一肯定關鍵詞，則改回逐項按語義判斷。
+3. 同一概念若同時出現否定與肯定（如 "no west-facing, want east-facing"），各取對應極性。
 
-合法 positive tag：{list(PPP_ENUM_FULL.keys())}
-合法 negative tag：{list(NPP_ENUM_FULL.keys())}
+# 標籤命名規則
+- snake_case，全小寫，不含空格、連字符、引號。
+- 例：east-facing → east_facing；need security → needs_security；no pool → no_pool。
+- 屬性類型詞（condo / apartment / landed / terrace / bungalow / studio）**不是偏好**，
+  忽略，不要輸出。
+- 不確定的詞寧可丟掉，**禁止編造**。
 
-僅輸出 JSON，不要任何說明文字：
-{{"positive": ["needs_security"], "negative": ["west_facing"]}}
+# 命名提示（非強制白名單，僅供風格對齊；遇到等價概念請優先用這些 key）
+常見 positive key 示例：{ppp_hint}
+常見 negative key 示例：{npp_hint}
+若用戶語義與上述任一 key 等價（不論大小寫/空格/連字符差異），輸出該 key。
+若用戶提出列表外的合理偏好，自行用 snake_case 命名輸出即可。
+
+# 輸出格式
+僅輸出 JSON，不要任何說明文字或 markdown 圍欄：
+{{"positive": ["needs_security"], "negative": ["east_facing"]}}
 若該極性無命中：對應陣列為 []。
                 """,
             }
@@ -145,14 +167,31 @@ class LLMClient:
 
             response = await self._call_api(payload)
             content = response["choices"][0]["message"]["content"]
+            print(f"[semantic_alignment] raw LLM content: {content!r}")
             parsed = json.loads(content)
 
-            pos = [t for t in parsed.get("positive", []) if t in PPP_ENUM_FULL]
-            neg = [t for t in parsed.get("negative", []) if t in NPP_ENUM_FULL]
+            def _normalize(raw) -> list[str]:
+                if not isinstance(raw, list):
+                    return []
+                out: list[str] = []
+                seen: set[str] = set()
+                for item in raw:
+                    if not isinstance(item, str):
+                        continue
+                    key = item.strip().lower().replace("-", "_").replace(" ", "_")
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+                return out
+
+            pos = _normalize(parsed.get("positive", []))
+            neg = _normalize(parsed.get("negative", []))
+            print(f"[semantic_alignment] normalized → positive={pos} negative={neg}")
             return {"positive": pos, "negative": neg}
 
         except Exception as e:
-            print(f"Semantic alignment failed: {e}")
+            print(f"[semantic_alignment] failed: {e}")
             return {"positive": [], "negative": []}
 
 
