@@ -5,18 +5,24 @@
 // labels. Values come from the store; missing optional fields render
 // as "—" rather than blank chips.
 //
-// Hard constraint: chips MUST NOT enter the centered safe zone where the
-// headline / sub-copy / progress bars are rendered.
+// Collision contract (NON-NEGOTIABLE):
+//   1. Chips MUST NOT enter the centered safe zone (headline / sub-copy
+//      / progress bars).
+//   2. Chips MUST NOT visually collide with each other, even with the
+//      longest label and full drift amplitude.
 //
 // Strategy:
-//   - Anchor each chip to a fixed corner offset (well outside the safe
-//     zone) and animate inside a bounded amplitude (~10px).
-//   - Motion is 2D + slight rotation, driven by one of four irregular
-//     drift keyframes with prime-ish durations/delays — no two chips
-//     share the same phase, so the overall pattern is non-periodic on
-//     human timescales (no synchronous up/down bobbing).
-//   - On viewports narrower than the safe-zone width + chip margin,
-//     chips are hidden — there is no honest position that avoids overlap.
+//   - All chips anchored to the left OR right edge (never the center).
+//   - Per side, chips are distributed across non-overlapping vertical
+//     bands. Each band reserves >= 22% of the host height; chip is ~28px
+//     tall + drift amplitude ~8px, so even at viewport=700px the gap
+//     between consecutive band centers (~150px) >> chip footprint.
+//   - Each chip is clamped to max-width 38% of the host so its right/left
+//     edge cannot reach the center safe zone.
+//   - Motion uses 4 irregular drift variants with prime-ish durations and
+//     unique delays → non-periodic on human timescales.
+//   - On viewports narrower than MIN_WIDTH_PX the safe zone + chip
+//     margins do not fit honestly, so chips are hidden.
 
 import { useEffect, useState } from "react";
 import { useAppStore } from "@/lib/store";
@@ -26,12 +32,10 @@ type DriftVariant = "a" | "b" | "c" | "d";
 interface Anchor {
   key: string;
   label: string;
-  // Position relative to the host container. Exactly one of left/right
-  // and one of top/bottom is set, in percent.
-  left?: string;
-  right?: string;
-  top?: string;
-  bottom?: string;
+  // Exactly one of left/right is set (chips always edge-anchored).
+  side: "left" | "right";
+  edgeOffset: string; // e.g. "4%"
+  top: string;        // vertical center expressed as top %
   delay: string;
   duration: string;
   variant: DriftVariant;
@@ -64,42 +68,60 @@ export function FloatingTags() {
 
   if (!visible) return null;
 
+  // Non-overlapping vertical bands. Left has 3 slots, right has 4 slots.
+  // Min gap between consecutive `top` on the same side = 22%.
   const anchors: Anchor[] = [
+    // ── LEFT column (3 slots: 14% / 44% / 74%) ──────────────────────
     {
       key: "budget",
       label: `BUDGET · ${fmtBudget(phase1?.budget)}`,
-      left: "4%",
-      top: "16%",
+      side: "left",
+      edgeOffset: "4%",
+      top: "14%",
       delay: "0s",
       duration: "7.3s",
       variant: "a",
       emphasis: true,
     },
     {
+      key: "lifestyle",
+      label: "LIFESTYLE",
+      side: "left",
+      edgeOffset: "6%",
+      top: "44%",
+      delay: "1.1s",
+      duration: "8.3s",
+      variant: "b",
+    },
+    {
+      key: "location",
+      label: `LOCATION · ${fmtText(phase1?.location)}`,
+      side: "left",
+      edgeOffset: "5%",
+      top: "74%",
+      delay: "1.3s",
+      duration: "6.7s",
+      variant: "c",
+      emphasis: true,
+    },
+    // ── RIGHT column (4 slots: 12% / 36% / 60% / 84%) ───────────────
+    {
       key: "house_type",
       label: `HOUSE TYPE · ${fmtText(phase1?.house_type)}`,
-      right: "4%",
-      top: "18%",
+      side: "right",
+      edgeOffset: "4%",
+      top: "12%",
       delay: "0.7s",
       duration: "8.9s",
       variant: "b",
       emphasis: true,
     },
     {
-      key: "location",
-      label: `LOCATION · ${fmtText(phase1?.location)}`,
-      left: "5%",
-      bottom: "20%",
-      delay: "1.3s",
-      duration: "6.7s",
-      variant: "c",
-      emphasis: true,
-    },
-    {
       key: "identity",
       label: "IDENTITY",
-      right: "6%",
-      top: "52%",
+      side: "right",
+      edgeOffset: "6%",
+      top: "36%",
       delay: "0.4s",
       duration: "9.7s",
       variant: "d",
@@ -107,26 +129,19 @@ export function FloatingTags() {
     {
       key: "target",
       label: "TARGET",
-      right: "8%",
-      bottom: "24%",
+      side: "right",
+      edgeOffset: "7%",
+      top: "60%",
       delay: "1.9s",
       duration: "7.9s",
       variant: "a",
     },
     {
-      key: "lifestyle",
-      label: "LIFESTYLE",
-      left: "7%",
-      top: "48%",
-      delay: "1.1s",
-      duration: "8.3s",
-      variant: "b",
-    },
-    {
       key: "dealbreakers",
       label: "DEALBREAKERS",
-      left: "9%",
-      bottom: "44%",
+      side: "right",
+      edgeOffset: "5%",
+      top: "84%",
       delay: "2.3s",
       duration: "10.1s",
       variant: "c",
@@ -139,25 +154,33 @@ export function FloatingTags() {
       className="pointer-events-none absolute inset-0 overflow-hidden"
     >
       {anchors.map((a) => (
+        // Outer wrapper owns the absolute anchor + vertical centering.
+        // Inner element owns the drift animation, so the two transforms
+        // don't compete (keyframes would otherwise overwrite translateY).
         <div
           key={a.key}
-          className={[
-            "drift absolute rounded-full border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] backdrop-blur-sm",
-            `drift-${a.variant}`,
-            a.emphasis
-              ? "border-primary/40 bg-primary/[0.06] text-foreground/80"
-              : "border-border/60 bg-surface/70 text-muted-foreground",
-          ].join(" ")}
+          className="absolute max-w-[38%]"
           style={{
-            left: a.left,
-            right: a.right,
+            [a.side]: a.edgeOffset,
             top: a.top,
-            bottom: a.bottom,
-            animationDelay: a.delay,
-            animationDuration: a.duration,
+            transform: "translateY(-50%)",
           }}
         >
-          {a.label}
+          <div
+            className={[
+              "drift truncate whitespace-nowrap rounded-full border px-3 py-1 font-mono text-[10px] uppercase tracking-[0.22em] backdrop-blur-sm",
+              `drift-${a.variant}`,
+              a.emphasis
+                ? "border-primary/40 bg-primary/[0.06] text-foreground/80"
+                : "border-border/60 bg-surface/70 text-muted-foreground",
+            ].join(" ")}
+            style={{
+              animationDelay: a.delay,
+              animationDuration: a.duration,
+            }}
+          >
+            {a.label}
+          </div>
         </div>
       ))}
     </div>

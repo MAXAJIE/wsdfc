@@ -1,9 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Send, Lock, Bot, User as UserIcon, Check, X } from "lucide-react";
+import { Send, Lock, Bot, User as UserIcon, Check, X, Sparkles } from "lucide-react";
 import { useAppStore } from "@/lib/store";
 import { api, type ChatContext } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { ThinkingBubble } from "./ThinkingBubble";
+
+// When the user has answered at least MUST_FILL_THRESHOLD essential
+// questions in Phase 2 (i.e. the "must-filled bracket"), the agent has
+// enough context to start searching. The popup notifies the user and
+// auto-redirects to SEARCHING after AUTO_REDIRECT_MS.
+const MUST_FILL_THRESHOLD = 3;
+const AUTO_REDIRECT_MS = 3000;
+
+// Human-readable labels for fields that may appear in a conflict.
+const FIELD_LABELS: Record<string, string> = {
+  budget: "budget",
+  target: "target",
+  identity: "identity",
+  gender: "gender",
+  agent_style: "agent style",
+  house_type: "house type",
+  location: "location",
+  description: "description",
+  bedrooms: "bedrooms",
+  bathrooms: "bathrooms",
+};
+
+function formatValue(v: unknown): string {
+  if (v === null || v === undefined || v === "") return "—";
+  if (typeof v === "number") return v.toLocaleString("en-MY");
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
 
 export function Conversation() {
   const appState = useAppStore((s) => s.appState);
@@ -18,26 +50,71 @@ export function Conversation() {
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // Enough-info redirect popup state. `dismissed` guarantees it only
+  // shows once per session, so the user is not nagged repeatedly.
+  const [readyPopup, setReadyPopup] = useState<{
+    open: boolean;
+    countdown: number;
+    dismissed: boolean;
+  }>({ open: false, countdown: AUTO_REDIRECT_MS / 1000, dismissed: false });
   const endRef = useRef<HTMLDivElement>(null);
 
   const locked =
-    appState === "SEARCHING" || appState === "SEMANTIC_ALIGNING" || sending;
+    appState === "SEARCHING" ||
+    appState === "SEMANTIC_ALIGNING" ||
+    sending ||
+    readyPopup.open;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages.length, pendingConflict, sending]);
 
-  // No preset greeting / opening question. The LLM owns the opening turn:
-  // when the user sends their FIRST message, we POST it to /chat and the
-  // assistant's reply (and any clarifying question) comes back from the
-  // model. The ThinkingBubble below renders while that first request is
-  // in flight, so the thinking process appears immediately after the
-  // user's first prompt — not the second.
+  // Count user turns to decide whether the "must-filled bracket" is met.
+  const userTurnCount = useMemo(
+    () => messages.filter((m) => m.role === "user").length,
+    [messages],
+  );
+
+  // Trigger enough-info popup when the user has filled at least the
+  // required bracket of essential answers AND we are still in CHATTING
+  // (no conflict pending, not already searching). Fires once.
+  useEffect(() => {
+    if (readyPopup.dismissed || readyPopup.open) return;
+    if (appState !== "CHATTING") return;
+    if (pendingConflict) return;
+    if (userTurnCount < MUST_FILL_THRESHOLD) return;
+    setReadyPopup({
+      open: true,
+      countdown: AUTO_REDIRECT_MS / 1000,
+      dismissed: false,
+    });
+  }, [userTurnCount, appState, pendingConflict, readyPopup]);
+
+  // Drive the popup countdown and auto-redirect to SEARCHING.
+  useEffect(() => {
+    if (!readyPopup.open) return;
+    const tick = setInterval(() => {
+      setReadyPopup((s) => {
+        if (!s.open) return s;
+        const next = s.countdown - 1;
+        if (next <= 0) {
+          // Auto-redirect: ask the backend to start searching by sending
+          // a synthetic "ready" message. The backend pipeline kicks in
+          // via fc_trigger and the SEARCHING screen takes over.
+          void triggerSearch();
+          return { open: false, countdown: 0, dismissed: true };
+        }
+        return { ...s, countdown: next };
+      });
+    }, 1000);
+    return () => clearInterval(tick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readyPopup.open]);
 
   // Build a Known-Facts block from Phase 1 + Phase 1.5 + everything the
-  // user has already said in Phase 2. We DO NOT try to re-summarise the
-  // dialogue (that would hallucinate facts); we pass it verbatim and let
-  // the backend prompt builder treat it as authoritative context.
+  // user has already said in Phase 2. We do not summarise the dialogue
+  // (that would hallucinate facts) — we pass it verbatim and let the
+  // backend prompt builder treat it as authoritative context.
   const chatContext: ChatContext | null = useMemo(() => {
     if (!phase1Form) return null;
     const userTurns = messages
@@ -60,11 +137,31 @@ export function Conversation() {
       semantic_tags: semanticTags,
       confirmed_facts,
       instruction:
-        "Do NOT re-ask the user for any fact already listed in confirmed_facts. " +
-        "Only ask about information that is genuinely missing. " +
-        "Reference known facts naturally instead of asking the user to repeat them.",
+        "Do NOT re-ask any fact in confirmed_facts. Actively grill the user " +
+        "for missing ideal-property details (specific area, bedrooms, " +
+        "bathrooms, must-haves, dealbreakers, timeline, financing). Ask one " +
+        "focused question per turn. Trigger search only when essentials are " +
+        "covered.",
     };
   }, [phase1Form, semanticTags, messages]);
+
+  const triggerSearch = async () => {
+    if (!sessionId) return;
+    try {
+      const res = await api.chat(
+        sessionId,
+        "I've shared enough. Please start searching for matches now.",
+        chatContext ?? undefined,
+      );
+      appendMessage({ role: "assistant", content: res.reply });
+      // Whatever the backend decided, force SEARCHING so the user is not
+      // stranded on the chat screen after the popup.
+      setAppState("SEARCHING");
+    } catch (e) {
+      console.warn("[chat:auto-search] failed", e);
+      // On failure, leave the user in chat so they can retry manually.
+    }
+  };
 
   const send = async () => {
     const text = input.trim();
@@ -92,16 +189,24 @@ export function Conversation() {
     }
   };
 
+  // Conflict resolution.
+  // - accept = true  → call /update_requirements with proposed_value.
+  // - accept = false → "opposite" action = keep the original value
+  //   already on file. No backend call; we just close the popup.
   const confirmConflict = async (accept: boolean) => {
     if (!pendingConflict || !sessionId) return;
+    const field = pendingConflict.conflicting_field;
+    const prev = (phase1Form as unknown as Record<string, unknown> | null)?.[field];
     if (accept) {
       try {
         await api.updateRequirements(sessionId, {
-          [pendingConflict.conflicting_field]: pendingConflict.proposed_value,
+          [field]: pendingConflict.proposed_value,
         });
         appendMessage({
           role: "assistant",
-          content: `Updated ${pendingConflict.conflicting_field}.`,
+          content: `Updated ${FIELD_LABELS[field] ?? field} from ${formatValue(prev)} to ${formatValue(
+            pendingConflict.proposed_value,
+          )}.`,
         });
       } catch (e) {
         console.warn(e);
@@ -109,7 +214,7 @@ export function Conversation() {
     } else {
       appendMessage({
         role: "assistant",
-        content: "Kept original requirement.",
+        content: `Kept ${FIELD_LABELS[field] ?? field} as ${formatValue(prev)}.`,
       });
     }
     setPendingConflict(null);
@@ -138,37 +243,19 @@ export function Conversation() {
 
           {sending && <ThinkingBubble />}
 
-
-
-
           {pendingConflict && (
-            <div className="flex animate-in fade-in slide-in-from-bottom-2 justify-start">
-              <div className="max-w-[85%] rounded-2xl rounded-tl-sm border border-warning/30 bg-warning/10 p-4">
-                <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.18em] text-warning">
-                  field conflict · {pendingConflict.conflicting_field}
-                </div>
-                <p className="mb-4 text-sm text-foreground">
-                  {pendingConflict.reply}
-                </p>
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    onClick={() => confirmConflict(true)}
-                    className="h-8 rounded-lg bg-primary text-primary-foreground"
-                  >
-                    <Check className="mr-1 h-3.5 w-3.5" /> Yes, update
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => confirmConflict(false)}
-                    className="h-8 rounded-lg"
-                  >
-                    <X className="mr-1 h-3.5 w-3.5" /> Keep original
-                  </Button>
-                </div>
-              </div>
-            </div>
+            <ConflictCard
+              field={pendingConflict.conflicting_field}
+              previousValue={
+                (phase1Form as unknown as Record<string, unknown> | null)?.[
+                  pendingConflict.conflicting_field
+                ]
+              }
+              proposedValue={pendingConflict.proposed_value}
+              reply={pendingConflict.reply}
+              onAccept={() => confirmConflict(true)}
+              onReject={() => confirmConflict(false)}
+            />
           )}
 
           <div ref={endRef} />
@@ -211,6 +298,120 @@ export function Conversation() {
               <Send className="h-4 w-4" />
             </Button>
           </div>
+        </div>
+      </div>
+
+      {readyPopup.open && (
+        <ReadyToSearchPopup
+          countdown={readyPopup.countdown}
+          onStayChat={() =>
+            setReadyPopup({ open: false, countdown: 0, dismissed: true })
+          }
+        />
+      )}
+    </div>
+  );
+}
+
+function ConflictCard({
+  field,
+  previousValue,
+  proposedValue,
+  reply,
+  onAccept,
+  onReject,
+}: {
+  field: string;
+  previousValue: unknown;
+  proposedValue: unknown;
+  reply: string;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  const label = FIELD_LABELS[field] ?? field;
+  const prev = formatValue(previousValue);
+  const next = formatValue(proposedValue);
+  return (
+    <div className="flex animate-in fade-in slide-in-from-bottom-2 justify-start">
+      <div className="max-w-[85%] rounded-2xl rounded-tl-sm border border-warning/30 bg-warning/10 p-4">
+        <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.18em] text-warning">
+          field conflict · {field}
+        </div>
+        <p className="mb-3 text-sm text-foreground">{reply}</p>
+        <div className="mb-4 rounded-lg border border-warning/20 bg-background/60 p-3 text-xs text-foreground/90">
+          <div>
+            <span className="font-mono uppercase tracking-wider text-muted-foreground">
+              Yes →
+            </span>{" "}
+            update <strong>{label}</strong> from <code>{prev}</code> to{" "}
+            <code>{next}</code>.
+          </div>
+          <div className="mt-1">
+            <span className="font-mono uppercase tracking-wider text-muted-foreground">
+              No →
+            </span>{" "}
+            keep <strong>{label}</strong> as <code>{prev}</code>.
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            onClick={onAccept}
+            className="h-8 rounded-lg bg-primary text-primary-foreground"
+          >
+            <Check className="mr-1 h-3.5 w-3.5" /> Yes, update
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onReject}
+            className="h-8 rounded-lg"
+          >
+            <X className="mr-1 h-3.5 w-3.5" /> Keep original
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReadyToSearchPopup({
+  countdown,
+  onStayChat,
+}: {
+  countdown: number;
+  onStayChat: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 backdrop-blur-sm">
+      <div className="glass-strong w-[min(90vw,420px)] animate-in fade-in zoom-in-95 rounded-2xl border border-border p-6 shadow-[var(--shadow-elegant)]">
+        <div className="mb-3 flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary-glow text-primary-foreground">
+            <Sparkles className="h-4 w-4" />
+          </div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-primary">
+            ready · enough context
+          </div>
+        </div>
+        <h3 className="mb-2 text-lg font-semibold tracking-tight">
+          We have what we need.
+        </h3>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Redirecting to property search in{" "}
+          <span className="font-mono font-semibold text-foreground">
+            {countdown}s
+          </span>
+          …
+        </p>
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onStayChat}
+            className="h-8 rounded-lg"
+          >
+            Stay & chat more
+          </Button>
         </div>
       </div>
     </div>
