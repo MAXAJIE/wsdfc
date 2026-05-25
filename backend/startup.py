@@ -6,8 +6,14 @@ Checks all dependencies, environment variables, and configuration before startin
 
 import os
 import sys
-import subprocess
 import asyncio
+
+# Windows: switch to ProactorEventLoop BEFORE any subprocess / uvicorn work.
+# Required for Playwright (asyncio.create_subprocess_exec) under uvicorn --reload.
+if sys.platform == "win32" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+import subprocess
 from pathlib import Path
 
 def check_python_version():

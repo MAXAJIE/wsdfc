@@ -82,22 +82,40 @@ async def _get(client: httpx.AsyncClient, url: str) -> str:
     raise RuntimeError(f"GET failed: {url}: {last_err}")
 
 
-async def _playwright_get(url: str) -> str:
-    """Used only when httpx is blocked. Playwright is already in requirements."""
+def _playwright_get_sync(url: str) -> str:
+    """
+    Synchronous Playwright fetch — must run in a worker thread (see _playwright_get).
+
+    Why sync (not async_playwright):
+      Under uvicorn on Windows the running event loop is sometimes a
+      SelectorEventLoop (uvicorn --reload worker, or an upstream lib that
+      overrides the policy). SelectorEventLoop does NOT implement
+      subprocess_exec, so async_playwright().start() raises NotImplementedError
+      from Connection.run(). sync_playwright spins up its own thread with a
+      private ProactorEventLoop, so it is immune to whatever loop uvicorn picked.
+    """
     try:
-        from playwright.async_api import async_playwright
+        from playwright.sync_api import sync_playwright
     except Exception as e:  # pragma: no cover
         raise RuntimeError(f"Playwright unavailable: {e}")
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
-            ctx = await browser.new_context(user_agent=random.choice(USER_AGENTS))
-            page = await ctx.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1500)
-            return await page.content()
+            ctx = browser.new_context(user_agent=random.choice(USER_AGENTS))
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1500)
+            return page.content()
         finally:
-            await browser.close()
+            browser.close()
+
+
+async def _playwright_get(url: str) -> str:
+    """Run the blocking sync_playwright call off the event loop."""
+    # Windows: ensure the worker thread sees ProactorEventLoopPolicy if it
+    # ever needs to create its own loop. sync_playwright manages its own
+    # thread+loop internally so this is belt-and-braces.
+    return await asyncio.to_thread(_playwright_get_sync, url)
 
 
 # ── parsing ──────────────────────────────────────────────────────────
@@ -299,12 +317,29 @@ async def scrape_region_type(
             except Exception:
                 return None
 
-        tasks = [fetch_one(u) for u in listing_urls[: target_count + 20]]
-        for coro in asyncio.as_completed(tasks):
-            row = await coro
-            if row and row.get("listing_url"):
-                collected.append(row)
-            if len(collected) >= target_count:
-                break
+        # Wrap coros in real Tasks so we can cancel pending work once we
+        # have enough results. Using asyncio.as_completed(list_of_coros) +
+        # break leaks the unfinished coroutines AND triggers the
+        # "Task exception was never retrieved" warnings you saw — every
+        # background coro that later raises (Playwright/httpx) has nowhere
+        # to deliver its exception. Explicit cancel + gather fixes both.
+        tasks: List[asyncio.Task] = [
+            asyncio.create_task(fetch_one(u)) for u in listing_urls[: target_count + 20]
+        ]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                row = await coro
+                if row and row.get("listing_url"):
+                    collected.append(row)
+                if len(collected) >= target_count:
+                    break
+        finally:
+            pending = [t for t in tasks if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                # Drain cancellations / retrieve any straggler exceptions so
+                # asyncio does not log "Task exception was never retrieved".
+                await asyncio.gather(*pending, return_exceptions=True)
 
     return collected

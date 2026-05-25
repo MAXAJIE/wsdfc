@@ -1,6 +1,15 @@
 """
 FastAPI application - Main entry point with all API endpoints.
 """
+# ── Windows event-loop policy MUST be set before any other import that may
+#    create or cache an asyncio loop (uvicorn, anyio, httpx transports, etc.).
+#    Without ProactorEventLoop, Playwright's subprocess_exec raises
+#    NotImplementedError on Windows.
+import sys as _sys
+import asyncio as _asyncio_boot
+if _sys.platform == "win32" and hasattr(_asyncio_boot, "WindowsProactorEventLoopPolicy"):
+    _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 import asyncio
@@ -45,12 +54,10 @@ from scraper.pipeline import run_pipeline as run_scraper_pipeline
 
 BACKEND_BOOT_ID = str(uuid.uuid4())
 
-import asyncio
 import re
 import sys
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# (Event-loop policy already set at module top before any other import.)
 
 # FastAPI app setup
 app = FastAPI(
