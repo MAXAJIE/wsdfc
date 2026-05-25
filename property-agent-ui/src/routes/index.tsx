@@ -12,6 +12,7 @@ import { ResultsBatch } from "@/components/phases/ResultsBatch";
 import { ActionRequired } from "@/components/phases/ActionRequired";
 import { Tier3NoResult } from "@/components/phases/Tier3NoResult";
 import { useAppStore } from "@/lib/store";
+import { resetIfBackendRestarted } from "@/lib/bootGuard";
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -26,10 +27,17 @@ function Index() {
   // navigates back to "/" and lets us rehydrate; no full location.reload
   // glitch needed.
   useEffect(() => {
-    hydrateFromStorage();
-    // intentionally one-shot
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    let cancelled = false;
+
+    void (async () => {
+      const didReset = await resetIfBackendRestarted();
+      if (!cancelled && !didReset) hydrateFromStorage();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrateFromStorage]);
 
   return (
     <AppShell>

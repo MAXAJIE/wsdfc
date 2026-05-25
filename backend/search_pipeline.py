@@ -91,20 +91,25 @@ async def execute_search_pipeline(session_id: str) -> tuple[list[PropertyRemark]
 
     # Step 4: Generate remarks via LLM
     search_session.search_stage = "generating_remarks"
+    # Parallel per-property remarks via Llama 3.1 8B (Chutes light model).
+    # Each property has its own try/except inside _remark_one_property, so a
+    # single LLM hiccup no longer kills the whole batch with an empty
+    # "Remarks generation failed, using degraded mode: " message.
     try:
-        remarks_response = await llm_client.generate_remarks(
+        remarks_response = await llm_client.generate_remarks_async(
             top_properties,
             agent_style=phase1.agent_style,
         )
         remarks = remarks_response.results
     except Exception as e:
-        print(f"Remarks generation failed, using degraded mode: {e}")
-        # Fallback: generate basic remarks without LLM
+        # Should not happen (per-property catches), but keep a hard fallback.
+        print(f"[search_pipeline] remarks batch crashed: "
+              f"{type(e).__name__}: {e!r}")
         remarks = [
             PropertyRemark(
                 property_id=p.property_id,
                 tier="tier_1" if i < 5 else "tier_2",
-                remarks=f"Property {p.title} at {p.price}",
+                remarks=f"{p.title} — {p.price}",
                 missing_features=[],
                 remedy=None,
             )

@@ -44,6 +44,10 @@ const BASE = (() => {
   return "http://localhost:8000/api/v1";
 })();
 
+export function getApiBaseUrl(): string {
+  return BASE;
+}
+
 
 const TRANSPORT: "sse" | "polling" =
   (typeof import.meta !== "undefined" &&

@@ -37,6 +37,7 @@ NPP_ENUM_FULL: dict[str, str] = {
     "far_from_mall": "遠商場",
     "near_industrial": "近工業區",
     "noise_area": "噪音區",
+    "no_noise": "無噪音",  # NEW
     "near_cemetery": "近墓地",
     "near_power_lines": "近高壓電線",
     "near_mosque": "近清真寺",
@@ -57,6 +58,10 @@ NPP_ENUM_FULL: dict[str, str] = {
     # 管理類
     "high_maintenance_fee": "高管理費",
     "low_maintenance": "低維護水平",
+
+    # 寵物 / 其他
+    "no_dog": "不允許養狗",  # NEW
+    "no_pets": "不允許養寵物",  # NEW
 }
 
 # Internal key set for validation

@@ -48,6 +48,21 @@ print(f"[llm_client] model={LLM_MODEL} max_tokens={LLM_MAX_TOKENS} concurrency={
 # Semaphore for LLM concurrent call limit (from config.yaml)
 llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
+# ── Phase-3 per-task model routing (env-overridable) ──────────────────
+# Defaults follow the user's spec:
+#   remarks   → light Llama 3.1 8B on Chutes
+#   reasoning → Qwen (dislike analysis)
+REMARKS_MODEL: str = os.getenv("REMARKS_MODEL", "chutesai/Llama-3.1-8B-Instruct")
+REASONING_MODEL: str = os.getenv("REASONING_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+REMARKS_MAX_TOKENS: int = int(os.getenv("REMARKS_MAX_TOKENS", "512"))
+REMARKS_CONCURRENCY: int = int(os.getenv("REMARKS_CONCURRENCY", "8"))
+print(f"[llm_client] REMARKS_MODEL={REMARKS_MODEL} REASONING_MODEL={REASONING_MODEL} "
+      f"REMARKS_MAX_TOKENS={REMARKS_MAX_TOKENS} REMARKS_CONCURRENCY={REMARKS_CONCURRENCY}")
+
+# Dedicated semaphore so per-property remarks parallelism does not starve
+# the main chat semaphore.
+remarks_semaphore = asyncio.Semaphore(REMARKS_CONCURRENCY)
+
 
 # FIX B5: read credentials from .env per Backend.md §2 instead of hardcoded placeholder.
 CHUTES_AI_API_KEY = os.getenv("CHUTES_AI_API_KEY", "")
@@ -162,7 +177,94 @@ class LLMClient:
             content = response["choices"][0]["message"]["content"]
             return json.loads(content)
 
+    def _normalize_tags_to_enum(
+        self,
+        tags: list[str],
+        enum_dict: dict[str, str],
+    ) -> list[str]:
+        """
+        Normalize user-friendly tag terms to actual enum keys.
 
+        Maps synonyms like "carpark"→"needs_parking", "securities"→"needs_security"
+        to the canonical enum keys. Only returns keys that exist in the enum.
+        """
+        # Common synonyms mapping to enum keys for both PPP and NPP
+        synonyms_map = {
+            # Positive (PPP) - carpark/security/transit/amenities
+            "carpark": "needs_parking",
+            "parking": "needs_parking",
+            "car_park": "needs_parking",
+            "car park": "needs_parking",
+            "securities": "needs_security",
+            "security": "needs_security",
+            "24h_security": "needs_security",
+            "24h security": "needs_security",
+            "24h_secure": "needs_security",
+            "mrt": "needs_near_mrt",
+            "lrt": "needs_near_lrt",
+            "transit": "needs_near_mrt",
+            "pool": "needs_pool",
+            "swimming_pool": "needs_pool",
+            "gym": "needs_gym",
+            "fitness": "needs_gym",
+            "high_floor": "needs_high_floor",
+            "high floor": "needs_high_floor",
+            "balcony": "needs_balcony",
+            "mall": "needs_near_mall",
+            "shopping": "needs_near_mall",
+            "school": "needs_near_school",
+            "hospital": "needs_near_hospital",
+            "lift": "needs_lift",
+            "elevator": "needs_lift",
+            "covered_parking": "needs_covered_parking",
+            "covered parking": "needs_covered_parking",
+            # Negative (NPP)
+            "no_dog": "no_dog",
+            "no dog": "no_dog",
+            "no_noise": "no_noise",
+            "no noise": "no_noise",
+            "no_parking": "no_parking",
+            "no parking": "no_parking",
+            "no_security": "no_security",
+            "no security": "no_security",
+            "west_facing": "west_facing",
+            "west facing": "west_facing",
+            "noisy": "noise_area",
+            "noise": "noise_area",
+            "far_mrt": "far_from_mrt",
+            "far from mrt": "far_from_mrt",
+        }
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for tag in tags:
+            if not tag or not isinstance(tag, str):
+                continue
+
+            tag_lower = tag.strip().lower().replace(" ", "_").replace("-", "_")
+
+            # Try direct match in enum first
+            if tag_lower in enum_dict:
+                if tag_lower not in seen:
+                    normalized.append(tag_lower)
+                    seen.add(tag_lower)
+                continue
+
+            # Try synonym mapping
+            if tag_lower in synonyms_map:
+                key = synonyms_map[tag_lower]
+                if key in enum_dict and key not in seen:
+                    normalized.append(key)
+                    seen.add(key)
+                continue
+
+            # Keep unmapped tags as-is if they look valid and exist in enum
+            if tag_lower in enum_dict and tag_lower not in seen:
+                normalized.append(tag_lower)
+                seen.add(tag_lower)
+
+        return normalized
 
     async def semantic_alignment(self, profile) -> dict[str, list[str]]:
         """
@@ -297,8 +399,14 @@ class LLMClient:
 
         pos = _normalize(parsed.get("positive", []))
         neg = _normalize(parsed.get("negative", []))
-        print(f"[semantic_alignment] normalized → positive={pos} negative={neg}")
-        return {"positive": pos, "negative": neg}
+
+        # Map tags to enum keys using synonym/fuzzy matching
+        pos_mapped = self._normalize_tags_to_enum(pos, PPP_ENUM_FULL)
+        neg_mapped = self._normalize_tags_to_enum(neg, NPP_ENUM_FULL)
+
+        print(f"[semantic_alignment] raw → positive={pos} negative={neg}")
+        print(f"[semantic_alignment] mapped → positive={pos_mapped} negative={neg_mapped}")
+        return {"positive": pos_mapped, "negative": neg_mapped}
 
 
 
@@ -422,6 +530,176 @@ class LLMClient:
         except Exception as e:
             print(f"NPP mapping failed: {e}")
             return []
+
+
+
+    async def _remark_one_property(
+        self,
+        prop,
+        agent_style: str,
+        model: str,
+    ) -> "PropertyRemark":
+        """
+        Generate the AI remark for a SINGLE property. Isolated so one
+        failure cannot abort the whole batch (fixes
+        "Remarks generation failed, using degraded mode: ").
+        """
+        from schemas import PropertyRemark
+        tier = "tier_1" if getattr(prop, "tier", None) == "tier_1" else "tier_2"
+        prop_block = (
+            f"ID: {prop.property_id}\n"
+            f"Title: {prop.title}\n"
+            f"Price: {prop.price}\n"
+            f"Tier: {tier}\n"
+            f"Features: {', '.join(prop.feature_tags)}"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是房產顧問，根據單一房源生成簡短中文 AI 評論。"
+                    "嚴格輸出 JSON：{\"remarks\":str,\"missing_features\":[str],"
+                    "\"remedy\":str|null}。不要 markdown，不要解釋。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"代理風格：{agent_style}\n\n房源：\n{prop_block}\n\n"
+                    "要求：\n"
+                    "- tier_1：正向推薦，missing_features=[]，remedy=null\n"
+                    "- tier_2：坦誠瑕疵 + 提供 remedy\n"
+                    "- 洪水高風險主動披露"
+                ),
+            },
+        ]
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": REMARKS_MAX_TOKENS,
+            "response_format": {"type": "json_object"},
+        }
+
+        async with remarks_semaphore:
+            try:
+                response = await self._call_api(payload)
+                content = response["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                return PropertyRemark(
+                    property_id=prop.property_id,
+                    tier=tier,
+                    remarks=str(parsed.get("remarks") or "").strip()
+                            or f"{prop.title} — {prop.price}",
+                    missing_features=list(parsed.get("missing_features") or []),
+                    remedy=parsed.get("remedy"),
+                )
+            except Exception as e:
+                # Per-property fallback. Logs WHY (type+repr) so it is no
+                # longer an empty "...degraded mode: " message.
+                print(f"[remarks] {prop.property_id} fell back: "
+                      f"{type(e).__name__}: {e!r}")
+                return PropertyRemark(
+                    property_id=prop.property_id,
+                    tier=tier,
+                    remarks=f"{prop.title} 位於目標區，價格 {prop.price}。",
+                    missing_features=[],
+                    remedy=None,
+                )
+
+    async def generate_remarks_async(
+        self,
+        properties: list,
+        agent_style: str = "professional",
+        model: Optional[str] = None,
+    ) -> "RemarksResponse":
+        """
+        Parallel per-property remarks generation via asyncio.gather.
+        Default model is light Llama 3.1 8B (Chutes) — faster than the
+        heavyweight chat model used in Phase 2.
+        """
+        from schemas import RemarksResponse
+        use_model = model or REMARKS_MODEL
+        tasks = [
+            self._remark_one_property(p, agent_style, use_model)
+            for p in properties
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return RemarksResponse(results=results)
+
+    async def reason_dislike(
+        self,
+        property_summary: dict,
+        user_reason: str,
+        current_ppp: list[str],
+        current_npp: list[str],
+        model: Optional[str] = None,
+    ) -> dict:
+        """
+        Phase 3: use Qwen to reason about WHY the user dislikes one property,
+        and propose deltas to PPP / NPP. Returns:
+          {"add_npp":[str], "remove_ppp":[str],
+           "add_ppp":[str], "rationale": str}
+        Tags are validated against the canonical enums; unknown tags are
+        dropped (caller can still log them).
+        """
+        from positive_enum import PPP_ENUM_FULL
+        use_model = model or REASONING_MODEL
+        ppp_keys = list(PPP_ENUM_FULL.keys())
+        npp_keys = list(NPP_ENUM_FULL.keys())
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是房產推薦反饋分析器。給定一個被使用者不喜歡的房源、"
+                    "使用者文字理由、以及目前 PPP/NPP 標籤集，推理應該如何"
+                    "更新偏好。嚴格輸出 JSON："
+                    "{\"add_npp\":[str],\"remove_ppp\":[str],"
+                    "\"add_ppp\":[str],\"rationale\":str}。"
+                    "標籤必須來自合法集合，否則略過。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"房源：{json.dumps(property_summary, ensure_ascii=False)}\n"
+                    f"使用者理由：{user_reason or '(未提供)'}\n"
+                    f"目前 PPP：{current_ppp}\n目前 NPP：{current_npp}\n"
+                    f"合法 PPP 集合：{ppp_keys}\n合法 NPP 集合：{npp_keys}"
+                ),
+            },
+        ]
+        payload = {
+            "model": use_model,
+            "messages": messages,
+            "max_tokens": 600,
+            "response_format": {"type": "json_object"},
+        }
+        async with llm_semaphore:
+            try:
+                response = await self._call_api(payload)
+                content = response["choices"][0]["message"]["content"]
+                parsed = json.loads(content) if isinstance(content, str) else {}
+            except Exception as e:
+                print(f"[reason_dislike] failed: {type(e).__name__}: {e!r}")
+                return {"add_npp": [], "remove_ppp": [],
+                        "add_ppp": [], "rationale": ""}
+
+        def _clean(items, allowed):
+            out = []
+            for t in items or []:
+                if isinstance(t, str) and t in allowed and t not in out:
+                    out.append(t)
+            return out
+
+        return {
+            "add_npp":   _clean(parsed.get("add_npp"),   NPP_ENUM_FULL),
+            "remove_ppp":_clean(parsed.get("remove_ppp"),PPP_ENUM_FULL),
+            "add_ppp":   _clean(parsed.get("add_ppp"),   PPP_ENUM_FULL),
+            "rationale": str(parsed.get("rationale") or "")[:500],
+        }
 
 
 # Global LLM client instance

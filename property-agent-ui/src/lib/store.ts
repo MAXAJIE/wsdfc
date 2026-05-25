@@ -67,6 +67,14 @@ function writeSnapshot(snap: PersistedSnapshot) {
   }
 }
 
+export function hasPersistedSessionSnapshot(): boolean {
+  return readSnapshot() !== null;
+}
+
+export function clearPersistedSessionSnapshot() {
+  clearSnapshot();
+}
+
 function clearSnapshot() {
   const w = safeWindow();
   if (!w) return;

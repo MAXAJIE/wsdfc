@@ -2,6 +2,7 @@ import { ArrowRight, AlertTriangle, ShieldCheck, Minus, Plus } from "lucide-reac
 import { useAppStore } from "@/lib/store";
 import { Button } from "@/components/ui/button";
 import { partitionTags } from "@/lib/semantic";
+import { getTagLabel } from "@/lib/enum-labels";
 
 export function ProfilingComplete() {
   const semanticTags = useAppStore((s) => s.semanticTags);
@@ -65,7 +66,7 @@ export function ProfilingComplete() {
                   key={`pos-${tag}`}
                   className="rounded-full border border-success/30 bg-success/10 px-3 py-1.5 font-mono text-xs text-success"
                 >
-                  +{tag}
+                  +{getTagLabel(tag, "pos")}
                 </span>
               ))}
             </div>
@@ -90,7 +91,7 @@ export function ProfilingComplete() {
                   key={`neg-${tag}`}
                   className="rounded-full border border-primary/20 bg-primary/[0.06] px-3 py-1.5 font-mono text-xs text-primary"
                 >
-                  −{tag}
+                  −{getTagLabel(tag, "neg")}
                 </span>
               ))}
             </div>
