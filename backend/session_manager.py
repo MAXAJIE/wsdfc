@@ -231,7 +231,8 @@ def tier_classification(
 
     for prop in properties:
         # Budget hard constraint (Python algorithm, never rely on LLM)
-        if not (budget_min <= prop.price <= budget_max):
+        _pp = prop.scraped_data.price
+        if _pp is None or not (budget_min <= _pp <= budget_max):
             continue
 
         # Blacklist check (current Search Session scope)

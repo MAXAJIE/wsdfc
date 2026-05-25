@@ -426,7 +426,7 @@ class LLMClient:
             return "tier_1" if getattr(p, "tier", None) == "tier_1" else "tier_2"
 
         props_summary = "\n".join([
-            f"ID: {p.property_id}, Title: {p.title}, Price: {p.price}, "
+            f"ID: {p.property_id}, Title: {p.scraped_data.title}, Price: {p.scraped_data.price}, "
             f"Tier: {_tier_label(p)}, "
             f"Features: {', '.join(p.feature_tags)}"
             for p in properties
@@ -549,8 +549,8 @@ class LLMClient:
         tier = "tier_1" if getattr(prop, "tier", None) == "tier_1" else "tier_2"
         prop_block = (
             f"ID: {prop.property_id}\n"
-            f"Title: {prop.title}\n"
-            f"Price: {prop.price}\n"
+            f"Title: {prop.scraped_data.title}\n"
+            f"Price: {prop.scraped_data.price}\n"
             f"Tier: {tier}\n"
             f"Features: {', '.join(prop.feature_tags)}"
         )
@@ -592,7 +592,7 @@ class LLMClient:
                     property_id=prop.property_id,
                     tier=tier,
                     remarks=str(parsed.get("remarks") or "").strip()
-                            or f"{prop.title} — {prop.price}",
+                            or f"{prop.scraped_data.title or prop.property_id} — {prop.scraped_data.price}",
                     missing_features=list(parsed.get("missing_features") or []),
                     remedy=parsed.get("remedy"),
                 )
@@ -604,7 +604,7 @@ class LLMClient:
                 return PropertyRemark(
                     property_id=prop.property_id,
                     tier=tier,
-                    remarks=f"{prop.title} 位於目標區，價格 {prop.price}。",
+                    remarks=f"{prop.scraped_data.title or prop.property_id} 位於目標區，價格 {prop.scraped_data.price}。",
                     missing_features=[],
                     remedy=None,
                 )

@@ -109,7 +109,7 @@ async def execute_search_pipeline(session_id: str) -> tuple[list[PropertyRemark]
             PropertyRemark(
                 property_id=p.property_id,
                 tier="tier_1" if i < 5 else "tier_2",
-                remarks=f"{p.title} — {p.price}",
+                remarks=f"{p.scraped_data.title or p.property_id} — {p.scraped_data.price}",
                 missing_features=[],
                 remedy=None,
             )
@@ -121,62 +121,36 @@ async def execute_search_pipeline(session_id: str) -> tuple[list[PropertyRemark]
 
 
 # ── adapter: scraped Mudah row → Property ─────────────────────────────
-_DISTRICT_FROM_REGION = {
-    "johor": "johor_bahru_city",
-    "kuala-lumpur": "kuala_lumpur_city",
-    "selangor": "petaling_jaya",
-    "penang": "george_town",
-    "melaka": "melaka_city",
-    "labuan": "labuan_city",
-    "putrajaya": "putrajaya_city",
-}
-
-
 def _row_to_property(row: dict) -> Property | None:
-    """Map a scraped Mudah row to the strict Property schema with safe defaults."""
+    """
+    Wrap a mudah_scraper._parse_detail dict (== ScrapedProperty fields) into
+    the Property schema unchanged. No field is dropped: raw_attributes and
+    image_urls survive verbatim inside scraped_data.
+    """
+    from schemas import ScrapedProperty
+    url = row.get("listing_url") or ""
+    if not url:
+        return None
     try:
-        price = row.get("price")
-        price = float(price) if price not in (None, "") else 0.0
-        beds = row.get("bedrooms") or 0
-        baths = row.get("bathrooms") or 0
-        url = row.get("listing_url") or ""
-        if not url:
-            return None
-        region = (row.get("region") or "").lower()
-        district = _DISTRICT_FROM_REGION.get(region, region.replace("-", "_") + "_city")
-        return Property(
-            property_id=f"MUDAH::{url}"[:128],
-            title=(row.get("title") or "Untitled")[:200],
-            price=price,
-            location=row.get("location") or row.get("city") or region,
-            administrative_district=district,
-            distance_to_mrt_km=0.0,
-            is_gated_guarded=False,
-            security_level="medium",
-            facilities=[],
-            facilities_score=0.5,
-            nearby_schools=0,
-            nearby_tuition_centers=0,
-            nearby_malls=0,
-            nearby_clinics=0,
-            lifestyle_proximity_score=0.5,
-            maintenance_fee_per_sqft=0.0,
-            normalized_maintenance_fee=0.0,
-            flood_risk="unknown",
-            feature_tags=[],
-            price_fit_score=0.5,
-            security_score=0.5,
-            transit_proximity_score=0.5,
-            floor_level=0,
-            facing="unknown",
-            bedrooms=int(beds) if beds else 0,
-            bathrooms=int(baths) if baths else 0,
-            url=url,
-            source="mudah.my",
-            is_mock=False,
-        )
+        scraped = ScrapedProperty(**{
+            k: v for k, v in row.items()
+            if k in ScrapedProperty.model_fields
+        })
     except Exception:
         return None
+    pid = (row.get("list_id") and f"MUDAH::{row['list_id']}") or f"MUDAH::{url}"
+    return Property(
+        property_id=pid[:128],
+        scraped_data=scraped,
+        feature_tags=[],
+        price_fit_score=0.0,
+        security_score=0.0,
+        transit_proximity_score=0.0,
+        lifestyle_proximity_score=0.0,
+        facilities_score=0.0,
+        normalized_maintenance_fee=0.0,
+        is_mock=False,
+    )
 
 
 async def fetch_raw_properties(
