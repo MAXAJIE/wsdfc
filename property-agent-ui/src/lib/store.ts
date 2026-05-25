@@ -8,6 +8,75 @@ import type {
   SearchStage,
 } from "./types";
 
+// ─── Temporary session memory (Phase 2.5 spec) ────────────────────────
+// Persistence rules:
+//   * Saved to localStorage so an accidental Reload survives.
+//   * Wiped automatically if the user is idle for > IDLE_TTL_MS
+//     (default 15 min).
+//   * `resetAll()` wipes it ("Return home" / Phase 3 new prompt).
+//   * `resetForKeepMemories()` keeps it ("Keep asking with memory").
+//   * Each new browser session starts empty IFF the previous one
+//     expired — otherwise we restore so Reload can recover from the
+//     error boundary.
+const STORAGE_KEY = "wsdfc:session:v1";
+const IDLE_TTL_MS = 15 * 60 * 1000;
+
+interface PersistedSnapshot {
+  sessionId: string | null;
+  phase1Form: Phase1Form | null;
+  semanticTags: string[];          // negative (NPP) keys
+  positiveTags: string[];          // positive (PPP) keys
+  alignmentWarning: boolean;
+  alignmentError: string | null;
+  dialogueMessages: DialogueMessage[];
+  rejectedIds: string[];
+  appState: AppState;
+  savedAt: number;
+}
+
+function safeWindow(): Window | null {
+  return typeof window === "undefined" ? null : window;
+}
+
+function readSnapshot(): PersistedSnapshot | null {
+  const w = safeWindow();
+  if (!w) return null;
+  try {
+    const raw = w.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const snap = JSON.parse(raw) as PersistedSnapshot;
+    if (!snap || typeof snap !== "object") return null;
+    if (Date.now() - (snap.savedAt ?? 0) > IDLE_TTL_MS) {
+      // Expired — wipe it so the next read returns empty.
+      w.localStorage.removeItem(STORAGE_KEY);
+      return null;
+    }
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
+function writeSnapshot(snap: PersistedSnapshot) {
+  const w = safeWindow();
+  if (!w) return;
+  try {
+    w.localStorage.setItem(STORAGE_KEY, JSON.stringify(snap));
+  } catch {
+    /* quota / private mode — silently ignore */
+  }
+}
+
+function clearSnapshot() {
+  const w = safeWindow();
+  if (!w) return;
+  try {
+    w.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 interface AppStore {
   // State machine
   appState: AppState;
@@ -22,10 +91,12 @@ interface AppStore {
   setPhase1Form: (f: Phase1Form) => void;
 
   // Semantic tags
-  semanticTags: string[];
+  semanticTags: string[];          // NPP (negative)
+  positiveTags: string[];          // PPP (positive)
   alignmentWarning: boolean;
   alignmentError: string | null;
   setSemanticTags: (tags: string[], warning?: boolean, error?: string | null) => void;
+  setPositiveTags: (tags: string[]) => void;
 
   // Dialogue
   dialogueMessages: DialogueMessage[];
@@ -70,6 +141,12 @@ interface AppStore {
   // Full reset
   resetAll: () => void;
   resetForKeepMemories: () => void;
+
+  // Persistence — Phase 2.5
+  hydrateFromStorage: () => boolean;     // true if a snapshot was restored
+  persistNow: () => void;                // force-save (also called on every relevant setter)
+  bumpActivity: () => void;              // refresh savedAt without changing data
+  hasRestorableSession: () => boolean;
 }
 
 const initialResults = {
@@ -81,91 +158,202 @@ const initialResults = {
   degraded: false,
 };
 
-export const useAppStore = create<AppStore>((set, get) => ({
-  appState: "IDLE",
-  setAppState: (s) => set({ appState: s }),
+export const useAppStore = create<AppStore>((set, get) => {
+  // Build a snapshot of the persistable slice of state.
+  const snapshot = (): PersistedSnapshot => {
+    const s = get();
+    return {
+      sessionId: s.sessionId,
+      phase1Form: s.phase1Form,
+      semanticTags: s.semanticTags,
+      positiveTags: s.positiveTags,
+      alignmentWarning: s.alignmentWarning,
+      alignmentError: s.alignmentError,
+      dialogueMessages: s.dialogueMessages,
+      rejectedIds: s.rejectedIds,
+      appState: s.appState,
+      savedAt: Date.now(),
+    };
+  };
+  const save = () => writeSnapshot(snapshot());
 
-  sessionId: null,
-  setSessionId: (id) => set({ sessionId: id }),
+  return {
+    appState: "IDLE",
+    setAppState: (s) => {
+      set({ appState: s });
+      save();
+    },
 
-  phase1Form: null,
-  setPhase1Form: (f) => set({ phase1Form: f }),
+    sessionId: null,
+    setSessionId: (id) => {
+      set({ sessionId: id });
+      save();
+    },
 
-  semanticTags: [],
-  alignmentWarning: false,
-  alignmentError: null,
-  setSemanticTags: (tags, warning = false, error = null) =>
-    set({ semanticTags: tags, alignmentWarning: warning, alignmentError: error }),
+    phase1Form: null,
+    setPhase1Form: (f) => {
+      set({ phase1Form: f });
+      save();
+    },
 
-  dialogueMessages: [],
-  appendMessage: (m) =>
-    set((st) => ({ dialogueMessages: [...st.dialogueMessages, m] })),
-  resetDialogue: () => set({ dialogueMessages: [] }),
+    semanticTags: [],
+    positiveTags: [],
+    alignmentWarning: false,
+    alignmentError: null,
+    setSemanticTags: (tags, warning = false, error = null) => {
+      set({ semanticTags: tags, alignmentWarning: warning, alignmentError: error });
+      save();
+    },
+    setPositiveTags: (tags) => {
+      set({ positiveTags: tags });
+      save();
+    },
 
-  pendingConflict: null,
-  setPendingConflict: (p) => set({ pendingConflict: p }),
+    dialogueMessages: [],
+    appendMessage: (m) => {
+      set((st) => ({ dialogueMessages: [...st.dialogueMessages, m] }));
+      save();
+    },
+    resetDialogue: () => {
+      set({ dialogueMessages: [] });
+      save();
+    },
 
-  searchStage: null,
-  setSearchStage: (s) => set({ searchStage: s }),
+    pendingConflict: null,
+    setPendingConflict: (p) => set({ pendingConflict: p }),
 
-  ...initialResults,
-  setResults: (data) =>
-    set({
-      currentBatch: data.results ?? get().currentBatch,
-      batchIndex: data.batch_index ?? get().batchIndex,
-      totalAvailable: data.total_available ?? get().totalAvailable,
-      hasMore: data.has_more ?? get().hasMore,
-      tier3Triggered: data.tier3_triggered ?? get().tier3Triggered,
-      degraded: data.degraded ?? get().degraded,
-    }),
+    searchStage: null,
+    setSearchStage: (s) => set({ searchStage: s }),
 
-  rejectionCount: 0,
-  rejectedIds: [],
-  setRejectionCount: (n) => set({ rejectionCount: n }),
-  addRejectedId: (id) =>
-    set((st) =>
-      st.rejectedIds.includes(id)
-        ? st
-        : { rejectedIds: [...st.rejectedIds, id] },
-    ),
+    ...initialResults,
+    setResults: (data) =>
+      set({
+        currentBatch: data.results ?? get().currentBatch,
+        batchIndex: data.batch_index ?? get().batchIndex,
+        totalAvailable: data.total_available ?? get().totalAvailable,
+        hasMore: data.has_more ?? get().hasMore,
+        tier3Triggered: data.tier3_triggered ?? get().tier3Triggered,
+        degraded: data.degraded ?? get().degraded,
+      }),
 
-  pollHandles: [],
-  registerHandle: (h) =>
-    set((st) => ({ pollHandles: [...st.pollHandles, h] })),
-  clearAllHandles: () => {
-    get().pollHandles.forEach((h) => clearInterval(h));
-    set({ pollHandles: [] });
-  },
+    rejectionCount: 0,
+    rejectedIds: [],
+    setRejectionCount: (n) => set({ rejectionCount: n }),
+    addRejectedId: (id) => {
+      set((st) =>
+        st.rejectedIds.includes(id)
+          ? st
+          : { rejectedIds: [...st.rejectedIds, id] },
+      );
+      save();
+    },
 
-  resetAll: () => {
-    get().pollHandles.forEach((h) => clearInterval(h));
-    set({
-      appState: "IDLE",
-      sessionId: null,
-      phase1Form: null,
-      semanticTags: [],
-      alignmentWarning: false,
-      alignmentError: null,
-      dialogueMessages: [],
-      pendingConflict: null,
-      searchStage: null,
-      rejectionCount: 0,
-      rejectedIds: [],
-      pollHandles: [],
-      ...initialResults,
-    });
-  },
+    pollHandles: [],
+    registerHandle: (h) =>
+      set((st) => ({ pollHandles: [...st.pollHandles, h] })),
+    clearAllHandles: () => {
+      get().pollHandles.forEach((h) => clearInterval(h));
+      set({ pollHandles: [] });
+    },
 
-  resetForKeepMemories: () => {
-    get().pollHandles.forEach((h) => clearInterval(h));
-    set({
-      appState: "CHATTING",
-      pendingConflict: null,
-      searchStage: null,
-      rejectionCount: 0,
-      rejectedIds: [],
-      pollHandles: [],
-      ...initialResults,
-    });
-  },
-}));
+    resetAll: () => {
+      get().pollHandles.forEach((h) => clearInterval(h));
+      // "Return home" / "new prompt" = fresh session — wipe temp memory.
+      clearSnapshot();
+      set({
+        appState: "IDLE",
+        sessionId: null,
+        phase1Form: null,
+        semanticTags: [],
+        positiveTags: [],
+        alignmentWarning: false,
+        alignmentError: null,
+        dialogueMessages: [],
+        pendingConflict: null,
+        searchStage: null,
+        rejectionCount: 0,
+        rejectedIds: [],
+        pollHandles: [],
+        ...initialResults,
+      });
+    },
+
+    resetForKeepMemories: () => {
+      get().pollHandles.forEach((h) => clearInterval(h));
+      set({
+        appState: "CHATTING",
+        pendingConflict: null,
+        searchStage: null,
+        rejectionCount: 0,
+        rejectedIds: [],
+        pollHandles: [],
+        ...initialResults,
+      });
+      // Persist the kept memory so Reload still recovers it.
+      save();
+    },
+
+    // ── Persistence API ──────────────────────────────────────────────
+    hydrateFromStorage: () => {
+      const snap = readSnapshot();
+      if (!snap) return false;
+      // Only restore "in-flight" sessions — never restore terminal /
+      // transient states that would skip past required UX gates.
+      const restorableStates: AppState[] = [
+        "CHATTING",
+        "PENDING_CONFIRMATION",
+        "BATCH_1_DISPLAY",
+        "BATCH_2_DISPLAY",
+        "ALL_REJECTED",
+        "ACTION_REQUIRED_UI",
+        "TIER3_NO_RESULT",
+        "PROFILING_COMPLETE",
+      ];
+      const safeState: AppState = restorableStates.includes(snap.appState)
+        ? snap.appState
+        : snap.dialogueMessages.length > 0
+          ? "CHATTING"
+          : "IDLE";
+
+      set({
+        sessionId: snap.sessionId,
+        phase1Form: snap.phase1Form,
+        semanticTags: snap.semanticTags ?? [],
+        positiveTags: snap.positiveTags ?? [],
+        alignmentWarning: snap.alignmentWarning ?? false,
+        alignmentError: snap.alignmentError ?? null,
+        dialogueMessages: snap.dialogueMessages ?? [],
+        rejectedIds: snap.rejectedIds ?? [],
+        appState: safeState,
+        // Reset transient runtime state — we never persist mid-flight
+        // search progress or live conflicts.
+        pendingConflict: null,
+        searchStage: null,
+        ...initialResults,
+      });
+      // Touch savedAt so the restore itself counts as activity.
+      save();
+      return true;
+    },
+
+    persistNow: save,
+    bumpActivity: () => writeSnapshot(snapshot()),
+    hasRestorableSession: () => readSnapshot() !== null,
+  };
+});
+
+// Bump activity on user interaction so the 15-min idle timer is
+// measured from the user's last real action, not just from the last
+// state mutation. Cheap, passive, no React dependency.
+if (typeof window !== "undefined") {
+  const bump = () => {
+    try {
+      useAppStore.getState().bumpActivity();
+    } catch {
+      /* ignore */
+    }
+  };
+  ["click", "keydown", "pointerdown"].forEach((ev) =>
+    window.addEventListener(ev, bump, { passive: true }),
+  );
+}

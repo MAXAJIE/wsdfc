@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
 import { DevPanel } from "@/components/DevPanel";
@@ -18,6 +19,17 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const appState = useAppStore((s) => s.appState);
+  const hydrateFromStorage = useAppStore((s) => s.hydrateFromStorage);
+
+  // On first mount, try to restore a non-expired temp session. This is
+  // how the ErrorComponent "Reload" button recovers progress — it just
+  // navigates back to "/" and lets us rehydrate; no full location.reload
+  // glitch needed.
+  useEffect(() => {
+    hydrateFromStorage();
+    // intentionally one-shot
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <AppShell>

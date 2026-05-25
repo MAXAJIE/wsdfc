@@ -1,9 +1,8 @@
 // Floating chips for the profiling page (Phase 1.5).
 //
-// Surfaces the live Phase 1 facts the agent is reasoning over —
-// budget, house type, location — alongside the original decorative
-// labels. Values come from the store; missing optional fields render
-// as "—" rather than blank chips.
+// Each chip surfaces a Phase 1 input value the user typed/picked, so the
+// agent's "memory" of what it knows is visible while semantic alignment
+// runs in the background.
 //
 // Collision contract (NON-NEGOTIABLE):
 //   1. Chips MUST NOT enter the centered safe zone (headline / sub-copy
@@ -23,9 +22,15 @@
 //     unique delays → non-periodic on human timescales.
 //   - On viewports narrower than MIN_WIDTH_PX the safe zone + chip
 //     margins do not fit honestly, so chips are hidden.
+//
+// Phase 1.5 update: chips now reflect *user input* from Phase 1 instead
+// of decorative-only labels. A chip is hidden entirely when the
+// underlying field is empty, so the user never sees a placeholder for
+// a value they did not actually supply.
 
 import { useEffect, useState } from "react";
 import { useAppStore } from "@/lib/store";
+import type { AgentStyle, Gender, Identity } from "@/lib/types";
 
 type DriftVariant = "a" | "b" | "c" | "d";
 
@@ -45,14 +50,43 @@ interface Anchor {
 // Below this viewport width the safe zone + chip margins do not fit.
 const MIN_WIDTH_PX = 880;
 
-function fmtBudget(n: number | undefined): string {
-  if (!n || n <= 0) return "—";
+const IDENTITY_LABEL: Record<Identity, string> = {
+  first_time_buyer: "First-time buyer",
+  investor: "Investor",
+  upgrader: "Upgrader",
+};
+const GENDER_LABEL: Record<Gender, string> = {
+  female: "Female",
+  male: "Male",
+  prefer_not_to_say: "Undisclosed",
+};
+const STYLE_LABEL: Record<AgentStyle, string> = {
+  Professional: "Professional",
+  Friendly: "Friendly",
+  Enthusiastic: "Enthusiastic",
+};
+
+function fmtBudget(n: number | undefined): string | null {
+  if (!n || n <= 0) return null;
   return `RM ${n.toLocaleString("en-MY")}`;
 }
 
-function fmtText(v: string | undefined): string {
+function trimText(v: string | undefined, max = 28): string | null {
   const t = (v ?? "").trim();
-  return t.length ? t : "—";
+  if (!t) return null;
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+// A non-overlapping band layout with up to 4 slots per side.
+const LEFT_TOPS = ["14%", "44%", "74%"];
+const RIGHT_TOPS = ["12%", "36%", "60%", "84%"];
+
+const VARIANTS: DriftVariant[] = ["a", "b", "c", "d"];
+
+interface ChipSpec {
+  key: string;
+  label: string;
+  emphasis?: boolean;
 }
 
 export function FloatingTags() {
@@ -68,85 +102,67 @@ export function FloatingTags() {
 
   if (!visible) return null;
 
-  // Non-overlapping vertical bands. Left has 3 slots, right has 4 slots.
-  // Min gap between consecutive `top` on the same side = 22%.
-  const anchors: Anchor[] = [
-    // ── LEFT column (3 slots: 14% / 44% / 74%) ──────────────────────
-    {
-      key: "budget",
-      label: `BUDGET · ${fmtBudget(phase1?.budget)}`,
-      side: "left",
-      edgeOffset: "4%",
-      top: "14%",
-      delay: "0s",
-      duration: "7.3s",
-      variant: "a",
-      emphasis: true,
-    },
-    {
-      key: "lifestyle",
-      label: "LIFESTYLE",
-      side: "left",
-      edgeOffset: "6%",
-      top: "44%",
-      delay: "1.1s",
-      duration: "8.3s",
-      variant: "b",
-    },
-    {
-      key: "location",
-      label: `LOCATION · ${fmtText(phase1?.location)}`,
-      side: "left",
-      edgeOffset: "5%",
-      top: "74%",
-      delay: "1.3s",
-      duration: "6.7s",
-      variant: "c",
-      emphasis: true,
-    },
-    // ── RIGHT column (4 slots: 12% / 36% / 60% / 84%) ───────────────
-    {
-      key: "house_type",
-      label: `HOUSE TYPE · ${fmtText(phase1?.house_type)}`,
-      side: "right",
-      edgeOffset: "4%",
-      top: "12%",
-      delay: "0.7s",
-      duration: "8.9s",
-      variant: "b",
-      emphasis: true,
-    },
-    {
+  // Build chip specs from the user's actual Phase 1 input. Anything the
+  // user did not supply is skipped — never shown as "—".
+  const specs: ChipSpec[] = [];
+
+  const budget = fmtBudget(phase1?.budget);
+  if (budget) specs.push({ key: "budget", label: `BUDGET · ${budget}`, emphasis: true });
+
+  const target = trimText(phase1?.target);
+  if (target) specs.push({ key: "target", label: `TARGET · ${target.toUpperCase()}`, emphasis: true });
+
+  if (phase1?.identity) {
+    specs.push({
       key: "identity",
-      label: "IDENTITY",
-      side: "right",
-      edgeOffset: "6%",
-      top: "36%",
-      delay: "0.4s",
-      duration: "9.7s",
-      variant: "d",
-    },
-    {
-      key: "target",
-      label: "TARGET",
-      side: "right",
-      edgeOffset: "7%",
-      top: "60%",
-      delay: "1.9s",
-      duration: "7.9s",
-      variant: "a",
-    },
-    {
-      key: "layout",
-      label: "LAYOUT",
-      side: "right",
-      edgeOffset: "5%",
-      top: "84%",
-      delay: "2.3s",
-      duration: "10.1s",
-      variant: "c",
-    },
-  ];
+      label: `IDENTITY · ${IDENTITY_LABEL[phase1.identity].toUpperCase()}`,
+      emphasis: true,
+    });
+  }
+
+  if (phase1?.agent_style) {
+    specs.push({
+      key: "agent_style",
+      label: `STYLE · ${STYLE_LABEL[phase1.agent_style].toUpperCase()}`,
+    });
+  }
+
+  if (phase1?.gender) {
+    specs.push({
+      key: "gender",
+      label: `GENDER · ${GENDER_LABEL[phase1.gender].toUpperCase()}`,
+    });
+  }
+
+  const desc = trimText(phase1?.description, 32);
+  if (desc) specs.push({ key: "description", label: `“${desc}”` });
+
+  // Distribute specs across left/right bands. Alternate sides so the
+  // composition stays balanced even when only some chips are present.
+  const anchors: Anchor[] = [];
+  let leftIdx = 0;
+  let rightIdx = 0;
+  specs.forEach((spec, i) => {
+    const side: "left" | "right" =
+      (i % 2 === 0 && leftIdx < LEFT_TOPS.length) || rightIdx >= RIGHT_TOPS.length
+        ? "left"
+        : "right";
+    const top =
+      side === "left"
+        ? LEFT_TOPS[Math.min(leftIdx++, LEFT_TOPS.length - 1)]
+        : RIGHT_TOPS[Math.min(rightIdx++, RIGHT_TOPS.length - 1)];
+    anchors.push({
+      key: spec.key,
+      label: spec.label,
+      side,
+      edgeOffset: side === "left" ? "5%" : "5%",
+      top,
+      delay: `${(i * 0.37) % 2.4}s`,
+      duration: `${6.7 + ((i * 1.3) % 3.5)}s`,
+      variant: VARIANTS[i % VARIANTS.length],
+      emphasis: spec.emphasis,
+    });
+  });
 
   return (
     <div

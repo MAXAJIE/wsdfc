@@ -13,8 +13,14 @@ import type {
 // at this pace so every step has time to "bling" (pulse + glow ring).
 const MIN_STAGE_MS = 10_000;
 
+// NOTE: Phase 1 emits AgentStyle as "Professional" | "Friendly" |
+// "Enthusiastic" (capitalised). A previous version of this file keyed
+// COPY by "professional" | "friendly" | "active", so COPY[style] was
+// undefined and COPY[style][stage] threw the moment the user landed on
+// the SEARCHING screen (e.g. right after answering cash/loan). Keys
+// here MUST match AgentStyle exactly — guarded below by a fallback.
 const COPY: Record<AgentStyle, Record<SearchStage, string>> = {
-  professional: {
+  Professional: {
     idle: "Preparing the search pipeline…",
     scraping: "Sourcing the latest property listings…",
     ranking: "Scoring listings against your preferences…",
@@ -22,14 +28,14 @@ const COPY: Record<AgentStyle, Record<SearchStage, string>> = {
       "AI is composing tailored analysis for each property…",
     complete: "Ready.",
   },
-  friendly: {
+  Friendly: {
     idle: "Warming up…",
     scraping: "Going to grab the freshest listings for you — back in a sec.",
     ranking: "Picking the ones that fit you best…",
     generating_remarks: "Almost done — writing up the highlights now.",
     complete: "All set!",
   },
-  active: {
+  Enthusiastic: {
     idle: "Preparing.",
     scraping: "Pulling listings live.",
     ranking: "Ranking by fit.",
@@ -53,7 +59,7 @@ function stageIndex(stage: SearchStage | null): number {
 
 export function Searching() {
   const sessionId = useAppStore((s) => s.sessionId);
-  const style = useAppStore((s) => s.phase1Form?.agent_style ?? "professional");
+  const style = useAppStore((s) => s.phase1Form?.agent_style ?? "Professional");
   const searchStage = useAppStore((s) => s.searchStage);
   const setSearchStage = useAppStore((s) => s.setSearchStage);
   const setResults = useAppStore((s) => s.setResults);
@@ -123,7 +129,10 @@ export function Searching() {
     backendComplete && uiIdx >= STAGES.length - 1
       ? "complete"
       : STAGES[Math.min(uiIdx, STAGES.length - 1)].key;
-  const currentCopy = COPY[style][uiStageKey];
+  // Defensive: if a future AgentStyle leaks through that we don't have copy
+  // for, fall back to Professional instead of throwing into the route
+  // errorComponent ("This page didn't load").
+  const currentCopy = (COPY[style] ?? COPY.Professional)[uiStageKey];
 
   return (
     <div className="mx-auto flex min-h-[65vh] max-w-2xl flex-col items-center justify-center text-center">

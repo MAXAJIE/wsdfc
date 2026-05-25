@@ -5,7 +5,9 @@ import {
   createRootRouteWithContext,
   HeadContent,
   Scripts,
+  useRouter,
 } from "@tanstack/react-router";
+import { useAppStore } from "@/lib/store";
 
 import appCss from "../styles.css?url";
 
@@ -33,6 +35,36 @@ function NotFoundComponent() {
 
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   console.error(error);
+  const router = useRouter();
+
+  // Reload: tear down the error boundary, rerun loaders, then bring
+  // the user back to "/" — where Index hydrateFromStorage() will
+  // restore the prior session/transcript from the temp memory file.
+  // We deliberately do NOT call location.reload(): full-page reloads
+  // during the React error state caused the "glitching" loop the user
+  // reported (mount → throw → unmount → mount).
+  const onReload = () => {
+    try {
+      router.invalidate();
+    } catch {
+      /* ignore */
+    }
+    reset();
+    router.navigate({ to: "/" });
+  };
+
+  // Go home: explicitly start a NEW session (per spec: "Return home
+  // starts a new session"). Wipe the temp memory file before navigating
+  // so hydrateFromStorage finds nothing to restore.
+  const onGoHome = () => {
+    try {
+      useAppStore.getState().resetAll();
+    } catch {
+      /* ignore */
+    }
+    reset();
+    router.navigate({ to: "/" });
+  };
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -41,21 +73,24 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
           This page didn't load
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Something went wrong on our end. You can try refreshing or head back home.
+          Something went wrong on our end. Reload restores your last session;
+          Go home starts a new one.
         </p>
         <div className="mt-6 flex flex-wrap justify-center gap-2">
           <button
-            onClick={() => location.reload()}
+            type="button"
+            onClick={onReload}
             className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
           >
             Reload
           </button>
-          <a
-            href="/"
+          <button
+            type="button"
+            onClick={onGoHome}
             className="inline-flex items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
           >
             Go home
-          </a>
+          </button>
         </div>
       </div>
     </div>

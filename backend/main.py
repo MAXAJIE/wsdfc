@@ -198,8 +198,60 @@ def _build_phase2_system_prompt(dialogue_session, client_context: dict | None) -
 
     Shared by /chat and /chat_opening so behaviour cannot drift between
     the proactive opener and subsequent turns.
+
+    The timeline / financing wording is **identity-aware** so an investor
+    is never asked "when do you plan to move in" — they are asked when
+    they plan to buy and their expected holding period. Upgraders are
+    also asked about selling their current home.
     """
     p1 = dialogue_session.phase1_data
+    identity = (getattr(p1, "identity", "") or "").lower()
+
+    if identity == "investor":
+        timeline_q = (
+            "預計購入時間 purchase_timeline（何時計劃下訂 / 完成購入）"
+        )
+        financing_q = "融資方式 financing（現金 / 房貸）與預期持有年期 hold_period"
+        extra_must_fill = "8. 預期租金回報 / 投資回報率 yield_target"
+        identity_rule = (
+            "用戶身份為 investor：嚴禁出現「入住」「自住」「打算何時搬進」之類措辭。"
+            "所有時間問題改問購入時程、持有年期、出租計劃與回報。"
+        )
+    elif identity == "upgrader":
+        timeline_q = (
+            "入住時間 move_in_timeline（何時計劃搬入新居）"
+        )
+        financing_q = (
+            "融資方式 financing（現金 / 房貸）"
+        )
+        extra_must_fill = (
+            "8. 現有自住房的處置計劃 current_home_plan（出售 / 出租 / 保留）與時程"
+        )
+        identity_rule = (
+            "用戶身份為 upgrader：需同時關心新居入住時間與現有房屋如何處置。"
+        )
+    else:
+        # first_time_buyer (default)
+        timeline_q = "入住時間 move_in_timeline（何時計劃搬入）"
+        financing_q = "融資方式 financing（現金 / 房貸）"
+        extra_must_fill = ""
+        identity_rule = (
+            "用戶身份為 first_time_buyer：聚焦自住需求、入住時間與首購房貸資格。"
+        )
+
+    must_fill_lines = [
+        "1. 具體地點 / 區域偏好（若 Phase 1 location 為空或過於籠統）",
+        "2. 期望臥室數量 bedrooms",
+        "3. 期望浴室數量 bathrooms",
+        "4. 必備設施 must-haves（停車位、保安、泳池…）",
+        "5. 絕對不要 dealbreakers（噪音、樓層、朝向…）",
+        f"6. {timeline_q}",
+        f"7. {financing_q}",
+    ]
+    if extra_must_fill:
+        must_fill_lines.append(extra_must_fill)
+    must_fill_block = "\n".join(must_fill_lines)
+
     system_prompt = f"""
 你是一位資深的智能房產銷售代理（馬來西亞市場）。
 你的任務：在 Phase 2 對話中，**主動、有條理地追問**用戶理想房產的細節，
@@ -216,14 +268,11 @@ def _build_phase2_system_prompt(dialogue_session, client_context: dict | None) -
 - 地點 location：{getattr(p1, 'location', '') or '(未填)'}
 - 隱含偏好 semantic_tags：{', '.join(p1.semantic_tags) if p1.semantic_tags else '(無)'}
 
+=== 身份規則（必須遵守）===
+{identity_rule}
+
 === 你必須主動追問的「必填細節」(must-fill bracket) ===
-1. 具體地點 / 區域偏好（若 Phase 1 location 為空或過於籠統）
-2. 期望臥室數量 bedrooms
-3. 期望浴室數量 bathrooms
-4. 必備設施 must-haves（停車位、保安、泳池…）
-5. 絕對不要 dealbreakers（噪音、樓層、朝向…）
-6. 入住時間 timeline
-7. 融資方式 financing（現金 / 房貸）
+{must_fill_block}
 
 每次只追問 1–2 個最關鍵且尚未明朗的細節，語氣自然，配合 agent_style。
 **禁止**重複詢問 confirmed_facts 中任何已知值。
