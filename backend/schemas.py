@@ -143,6 +143,12 @@ class SearchSession(BaseModel):
     tier1_pool: list[Property] = Field(default_factory=list)
     tier2_pool: list[Property] = Field(default_factory=list)
     all_results: list[Property] = Field(default_factory=list)
+    # FIX: previously the LLM-generated remarks computed by
+    # execute_search_pipeline were RETURNED from the background task and
+    # then silently discarded (BackgroundTasks ignores return values), so
+    # /search_status and /next_batch never surfaced the AI commentary.
+    # Persist them keyed by property_id and slice alongside each batch.
+    remarks_by_id: dict[str, PropertyRemark] = Field(default_factory=dict)
     rejected_property_ids: list[str] = Field(default_factory=list)
     search_stage: Literal["idle", "scraping", "ranking", "generating_remarks", "complete"] = "idle"
 
@@ -181,6 +187,8 @@ class SearchStatusResponse(BaseModel):
     tier3_triggered: Optional[bool] = None
     degraded: Optional[bool] = None
     results: Optional[list[Property]] = None
+    # Aligned 1:1 with `results` (same length, same order) when status=="complete".
+    remarks: list[PropertyRemark] = Field(default_factory=list)
 
 
 # FIX B3: same as B2.
@@ -191,6 +199,8 @@ class NextBatchResponse(BaseModel):
     tier3_triggered: bool
     degraded: bool
     results: list[Property]
+    # Aligned 1:1 with `results` (same length, same order).
+    remarks: list[PropertyRemark] = Field(default_factory=list)
 
 
 # FIX B1: added rejection_count which main.py already passes.

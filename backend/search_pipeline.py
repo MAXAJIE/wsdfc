@@ -116,6 +116,11 @@ async def execute_search_pipeline(session_id: str) -> tuple[list[PropertyRemark]
             for i, p in enumerate(top_properties)
         ]
 
+    # FIX: persist remarks so /search_status and /next_batch can hand
+    # them to the frontend. Before this they were returned to the
+    # BackgroundTasks runner — which discards return values — and lost.
+    search_session.remarks_by_id = {r.property_id: r for r in remarks}
+
     search_session.search_stage = "complete"
     return remarks, False
 
@@ -208,17 +213,3 @@ async def fetch_raw_properties(
         properties = all_props[:50]
 
     return properties[:50]
-
-
-async def get_next_batch(session_id: str) -> list[PropertyRemark]:
-    """
-    Get next batch of 5 properties without triggering rejection learning.
-    """
-    search_session = get_search_session(session_id)
-    if not search_session:
-        raise ValueError(f"Session not found: {session_id}")
-
-    # This is a pure UI fetch - no rejection learning
-    # In full implementation, would slice from all_results
-    return []
-

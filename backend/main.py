@@ -1074,6 +1074,119 @@ async def update_requirements(request: UpdateRequirementsRequest):
     )
 
 
+
+# ─── Phase-3 helpers ────────────────────────────────────────────────
+def _remarks_for(search_session, batch_results):
+    """
+    Build a list of PropertyRemark aligned 1:1 with batch_results. Missing
+    entries (LLM partial failure / pre-existing sessions without a remarks
+    map) get a deterministic placeholder so the response shape is stable.
+    """
+    from schemas import PropertyRemark
+    out = []
+    remarks_by_id = getattr(search_session, "remarks_by_id", {}) or {}
+    for prop in batch_results:
+        r = remarks_by_id.get(prop.property_id)
+        if r is None:
+            r = PropertyRemark(
+                property_id=prop.property_id,
+                tier="tier_1",
+                remarks=(
+                    f"{prop.scraped_data.title or prop.property_id} — "
+                    f"{prop.scraped_data.price}"
+                ),
+                missing_features=[],
+                remedy=None,
+            )
+        out.append(r)
+    return out
+
+
+class ReasonDislikeRequest(BaseModel):
+    session_id: str
+    property_id: str
+    reason: str = ""
+
+
+class ReasonDislikeResponse(BaseModel):
+    add_npp: list[str]
+    remove_ppp: list[str]
+    add_ppp: list[str]
+    rationale: str
+    applied: bool
+
+
+@app.post("/api/v1/reason_dislike", response_model=ReasonDislikeResponse)
+async def reason_dislike(request: ReasonDislikeRequest):
+    """
+    Phase-3 dislike reasoning. Wraps llm_client.reason_dislike (Qwen) and
+    APPLIES the resulting deltas to the session:
+      - add_npp     → appended/deduped into npp_session.npp_tags
+      - add_ppp     → appended/deduped into phase1.positive_tags
+      - remove_ppp  → stripped from   phase1.positive_tags
+    """
+    dialogue_session = get_dialogue_session(request.session_id)
+    npp_session = get_npp_session(request.session_id)
+    search_session = get_search_session(request.session_id)
+    if not dialogue_session or not npp_session or not search_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    prop = next(
+        (p for p in search_session.all_results
+         if p.property_id == request.property_id),
+        None,
+    )
+    if prop is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Property {request.property_id} not in current result pool",
+        )
+
+    summary = {
+        "property_id": prop.property_id,
+        "title": prop.scraped_data.title,
+        "price": prop.scraped_data.price,
+        "feature_tags": prop.feature_tags,
+    }
+
+    try:
+        result = await llm_client.reason_dislike(
+            property_summary=summary,
+            user_reason=request.reason,
+            current_ppp=list(dialogue_session.phase1_data.positive_tags or []),
+            current_npp=list(npp_session.npp_tags or []),
+        )
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream LLM unavailable: {type(e).__name__}: {e}",
+        )
+
+    add_npp = list(result.get("add_npp") or [])
+    add_ppp = list(result.get("add_ppp") or [])
+    remove_ppp = list(result.get("remove_ppp") or [])
+    rationale = str(result.get("rationale") or "")
+
+    applied = bool(add_npp or add_ppp or remove_ppp)
+    if add_npp:
+        update_npp_tags(request.session_id, add_npp)
+    if add_ppp or remove_ppp:
+        cur = list(dialogue_session.phase1_data.positive_tags or [])
+        cur = [t for t in cur if t not in set(remove_ppp)]
+        for t in add_ppp:
+            if t not in cur:
+                cur.append(t)
+        dialogue_session.phase1_data.positive_tags = cur
+
+    return ReasonDislikeResponse(
+        add_npp=add_npp,
+        remove_ppp=remove_ppp,
+        add_ppp=add_ppp,
+        rationale=rationale,
+        applied=applied,
+    )
+
+
 # ─── Health check ────────────────────────────────────────────────────
 @app.get("/health")
 async def health():

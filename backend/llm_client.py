@@ -11,6 +11,8 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    wait_random_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
 from pydantic import ValidationError
@@ -97,21 +99,59 @@ if not CHUTES_AI_API_KEY:
     )
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """
+    Decide whether an exception from the Chutes API is worth retrying.
+
+    Retry on:
+      - any httpx transport-layer error (ReadError, RemoteProtocolError,
+        ConnectError, WriteError, PoolTimeout, …) — these are exactly the
+        "upstream killed the keep-alive socket" failures the caller saw.
+      - asyncio.TimeoutError
+      - HTTPStatusError ONLY for 408/425/429 and 5xx; 4xx (e.g. 400 bad
+        payload, 401 bad key, 402 out of credits) MUST surface immediately
+        instead of burning quota on doomed retries.
+    """
+    if isinstance(exc, (httpx.TransportError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (408, 425, 429, 500, 502, 503, 504)
+    return False
+
+
 class LLMClient:
     def __init__(self, api_key: str = CHUTES_AI_API_KEY, base_url: str = CHUTES_AI_BASE_URL):
         self.api_key = api_key
         self.base_url = base_url
-        self.client = httpx.AsyncClient()
+        # Hardened transport: explicit per-phase timeouts plus a small,
+        # bounded keep-alive pool with a short expiry. Chutes (and most
+        # serverless LLM gateways) terminate idle TCP/TLS sessions after
+        # ~30s; reusing one past that point is exactly what causes the
+        # `httpx.ReadError` the caller was hitting.
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0),
+            limits=httpx.Limits(
+                max_connections=LLM_CONCURRENCY + REMARKS_CONCURRENCY + 4,
+                max_keepalive_connections=4,
+                keepalive_expiry=15.0,
+            ),
+            http2=False,
+            trust_env=False,
+            follow_redirects=False,
+        )
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=5, min=5, max=20),
-        retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
+        stop=stop_after_attempt(5),
+        # Exponential with jitter so concurrent failures don't dog-pile at
+        # fixed 5/10/20s intervals. Caps at ~15s per wait.
+        wait=wait_random_exponential(multiplier=1, min=1, max=15),
+        retry=retry_if_exception(_is_retryable),
         reraise=True,
     )
     async def _call_api(self, payload: dict) -> dict:
         """
-        Internal API call with exponential backoff: 5s → 10s → 20s.
+        Internal API call with jittered exponential backoff (up to 5 tries).
+        Only retries transport errors and retryable HTTP statuses.
         Raises on final failure.
         """
         headers = {
