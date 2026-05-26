@@ -1,152 +1,22 @@
-From: Lovable <noreply@lovable.dev>
-Subject: [PATCH] fix: live_filter import / PARSER fallback / remarks 404 fallback
-
-Three independent, non-hacky fixes for issues surfaced by terminal logs:
-
-1) backend/scraper/live_filter.py
-   `from ..session_manager import …` raises "attempted relative import beyond
-   top-level package" because `backend/` is the cwd / sys.path root, NOT a
-   Python package (no `backend/__init__.py`). Every other module in this
-   codebase uses flat absolute imports (e.g. llm_client.py: `from schemas
-   import …`). Aligning live_filter restores _gather_text(), so user brief
-   text actually reaches regex + LLM augment, so house_type / bedrooms /
-   budget filters are populated again. Without this, build_live_filter()
-   silently returns {} and the scraper fans out unfiltered, breaking the
-   match between scraped pool and user intent (downstream: ranking_agent
-   has nothing relevant → remarks input empty → Phase 3 looks "broken").
-
-2) backend/scraper/mudah_scraper.py
-   PARSER is hard-coded to "lxml". If lxml is ever uninstalled or missing
-   in a deploy env, BeautifulSoup raises bs4.FeatureNotFound inside
-   _extract_listing_urls(), which is NOT covered by the page-loop
-   try/except, propagates out of scrape_region_type, and is swallowed by
-   the seeder's `except Exception → return 0`, producing the exact
-   `{'johor': 0}` symptom with zero diagnostic. Replace with a try-import
-   that falls back to "html.parser" and prints which parser is in use at
-   module load. Behaviour-preserving when lxml IS installed.
-
-3) backend/llm_client.py — _remark_one_property
-   REMARKS_MODEL default `chutesai/Llama-3.1-8B-Instruct` is currently
-   returning 404 from Chutes (model slug deprecated / not deployed on the
-   active account). Today every per-property remark falls back to a
-   templated string. Add a single retry against the project's main
-   LLM_MODEL (e.g. DeepSeek-V3.2-TEE) ONLY when the failure is an
-   HTTPStatusError 404 / 400 (model-routing errors) and the model we just
-   tried was not already LLM_MODEL. Other failure modes (network, 5xx,
-   timeout, validation) keep the existing degraded-template fallback so
-   we never amplify outages.
-
----
- backend/llm_client.py             | 33 ++++++++++++++++++++++++-------
- backend/scraper/live_filter.py    |  6 +++---
- backend/scraper/mudah_scraper.py  | 14 +++++++++++--
- 3 files changed, 41 insertions(+), 12 deletions(-)
-
-diff --git a/backend/scraper/live_filter.py b/backend/scraper/live_filter.py
---- a/backend/scraper/live_filter.py
-+++ b/backend/scraper/live_filter.py
-@@ -70,11 +70,11 @@ def _regex_bedrooms(text: str) -> Optional[int]:
- def _gather_text(session_id: str) -> str:
-     """Concatenate all user-derived text the LLM/regex should consider."""
-     try:
--        from ..session_manager import (
-+        from session_manager import (
-             get_dialogue_session, get_npp_session,
-         )
-     except Exception as e:  # pragma: no cover
--        logger.warning("[live_filter] session_manager import failed: %s", e)
-+        logger.error("[live_filter] session_manager import failed: %s", e)
-         return ""
- 
-     ds = get_dialogue_session(session_id)
-@@ -101,7 +101,7 @@ def _gather_text(session_id: str) -> str:
- 
- def _budget_range(session_id: str) -> tuple[Optional[float], Optional[float]]:
-     try:
--        from ..session_manager import get_search_session
-+        from session_manager import get_search_session
-     except Exception:  # pragma: no cover
-         return (None, None)
-     ss = get_search_session(session_id)
-diff --git a/backend/scraper/mudah_scraper.py b/backend/scraper/mudah_scraper.py
 --- a/backend/scraper/mudah_scraper.py
 +++ b/backend/scraper/mudah_scraper.py
-@@ -28,7 +28,17 @@
- # HTML parser used across this module. `lxml` is materially faster than
- # `html.parser` on Mudah's ~250 KB detail pages and is required for the
- # `:-soup-contains` CSS pseudo-class used in amenity extraction.
--PARSER = "lxml"
-+# Fall back to the stdlib parser when lxml is unavailable so the scraper
-+# degrades instead of returning silent 0-row results via bs4.FeatureNotFound.
-+def _pick_parser() -> str:
-+    try:
-+        import lxml  # noqa: F401
-+        return "lxml"
-+    except ImportError:
-+        return "html.parser"
-+
-+PARSER = _pick_parser()
-+print(f"[mudah_scraper] HTML parser in use: {PARSER}", flush=True)
- 
- # HTTP/2 connection limits. Shared across regions in seeder, so the pool
- # survives the whole run instead of being torn down per-region.
-
-
-diff --git a/backend/llm_client.py b/backend/llm_client.py
---- a/backend/llm_client.py
-+++ b/backend/llm_client.py
-@@ -629,28 +629,50 @@ class LLMClient:
-             "response_format": {"type": "json_object"},
-         }
- 
-         async with remarks_semaphore:
--            try:
--                response = await self._call_api(payload)
--                content = response["choices"][0]["message"]["content"]
--                parsed = json.loads(content)
-+            response = None
-+            used_model = model
-+            try:
-+                try:
-+                    response = await self._call_api(payload)
-+                except httpx.HTTPStatusError as he:
-+                    # Model-routing failure (slug deprecated / not deployed
-+                    # on this account). Retry ONCE with the project's main
-+                    # LLM_MODEL so remarks still get a real LLM pass instead
-+                    # of the templated degraded fallback. Only fires when
-+                    # the model we just tried is NOT already LLM_MODEL, to
-+                    # avoid an infinite loop on a genuinely-bad payload.
-+                    if (
-+                        he.response.status_code in (400, 404)
-+                        and used_model != LLM_MODEL
-+                    ):
-+                        print(f"[remarks] {prop.property_id} model={used_model} "
-+                              f"got HTTP {he.response.status_code}; "
-+                              f"retrying with LLM_MODEL={LLM_MODEL}", flush=True)
-+                        used_model = LLM_MODEL
-+                        retry_payload = {**payload, "model": LLM_MODEL}
-+                        response = await self._call_api(retry_payload)
-+                    else:
-+                        raise
-+                content = response["choices"][0]["message"]["content"]
-+                parsed = json.loads(content)
-                 return PropertyRemark(
-                     property_id=prop.property_id,
-                     tier=tier,
-                     remarks=str(parsed.get("remarks") or "").strip()
-                             or f"{prop.scraped_data.title or prop.property_id} — {prop.scraped_data.price}",
-                     missing_features=list(parsed.get("missing_features") or []),
-                     remedy=parsed.get("remedy"),
-                 )
-             except Exception as e:
-                 # Per-property fallback. Logs WHY (type+repr) so it is no
-                 # longer an empty "...degraded mode: " message.
-                 print(f"[remarks] {prop.property_id} fell back: "
-                       f"{type(e).__name__}: {e!r}")
-                 return PropertyRemark(
-                     property_id=prop.property_id,
-                     tier=tier,
-                     remarks=f"{prop.scraped_data.title or prop.property_id} 位於目標區，價格 {prop.scraped_data.price}。",
-                     missing_features=[],
-                     remedy=None,
-                 )
+@@ -115,7 +115,18 @@
+             r = await client.get(url, headers=_headers(), follow_redirects=True, timeout=REQUEST_TIMEOUT)
+             if r.status_code in (200, 201):
+                 text = r.text
+-                if len(text) < 800 or "captcha" in text.lower() or "are you a human" in text.lower():
++                # Anti-bot detection. Only inspect the first 5 KB and require
++                # whole-word matches — Mudah's real listing pages (~800 KB)
++                # lazy-load a `recaptcha` script tag near the bottom, which
++                # the previous `"captcha" in text.lower()` substring check
++                # flagged as a ban on every successful response (root cause
++                # of `realtime empty attempt N: empty result {region: 0}`).
++                head = text[:5000].lower()
++                if len(text) < 1500 or re.search(
++                    r"\b(captcha|are you a human|attention required|"
++                    r"just a moment|access denied)\b",
++                    head,
++                ):
+                     raise ScraperBanned(f"anti-bot suspected (len={len(text)})")
+                 return text
+             if r.status_code in _BANNED_STATUS:
