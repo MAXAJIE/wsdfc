@@ -65,7 +65,8 @@ def apply_dynamic_weights(
 
     # Normalize
     total = sum(adjusted.values())
-    assert total > 0, f"Weight sum is zero, normalization failed: {adjusted}"
+    if total <= 0:
+        raise ValueError(f"Weight sum is zero, normalization failed: {adjusted}")
 
     normalized = {k: v / total for k, v in adjusted.items()}
 
@@ -103,53 +104,79 @@ def build_top10(
     weight_vector: dict,
 ) -> list[tuple[float, Property, str]]:
     """
-    Build Top 10 from Tier 1 and Tier 2 pools.
+    Build Top 10 from Tier 1 and Tier 2 pools with smart tier bias.
+    
     Returns: list of (score, property, tier) tuples, sorted descending by score.
-
-    Priority: Tier 1 first (if >= 10), then fill with Tier 2.
+    
+    Algorithm:
+    1. Filter properties with None prices to tier 3 (abandoned)
+    2. Sort Tier 1 by (score desc, price asc, property_id asc)
+    3. If Tier 1 >= 10: return top 10
+    4. If best Tier 2 score >= 90% of best Tier 1: re-sort merged list (pure merit)
+    5. Otherwise: keep Tier 1 bias, fill from Tier 2
+    
+    Tiebreaker: lowest price first (value properties ranked higher)
     """
+    # Helper: filter properties with valid prices, collect None-price to tier 3
+    def has_valid_price(p: Property) -> bool:
+        return p.scraped_data.price is not None
+    
+    # Filter pools, abandoning None prices to tier 3
+    tier1_valid = [p for p in tier1_pool if has_valid_price(p)]
+    tier2_valid = [p for p in tier2_pool if has_valid_price(p)]
+    
+    # Compute scores and build tuples with price tiebreaker (ascending = lowest first)
     scored_tier1 = [
         (compute_weighted_score(p, weight_vector), p, "tier_1")
-        for p in tier1_pool
+        for p in tier1_valid
     ]
-    # Sort by score primarily; use price and property_id for safe tie-breaking
-    # to prevent Pydantic Property objects from causing TypeError on ties.
+    
+    # Sort by score (desc), then by price (asc for value), then by property_id (asc for determinism)
     scored_tier1.sort(
         key=lambda x: (
-            x[0],
-            -x[1].scraped_data.price if getattr(x[1], "scraped_data", None) and getattr(x[1].scraped_data, "price", None) is not None else 0,
-            getattr(x[1], "property_id", ""),
+            -x[0],  # Score descending
+            x[1].scraped_data.price,  # Price ascending (lowest first)
+            x[1].property_id,  # Property ID ascending (determinism)
         ),
-        reverse=True,
+        reverse=False,
     )
-
+    
     if len(scored_tier1) >= 10:
         return scored_tier1[:10]
-
+    
     # Need to fill with Tier 2
     needed = 10 - len(scored_tier1)
     scored_tier2 = [
         (compute_weighted_score(p, weight_vector), p, "tier_2")
-        for p in tier2_pool
+        for p in tier2_valid
     ]
+    
     scored_tier2.sort(
         key=lambda x: (
-            x[0],
-            -x[1].scraped_data.price if getattr(x[1], "scraped_data", None) and getattr(x[1].scraped_data, "price", None) is not None else 0,
-            getattr(x[1], "property_id", ""),
+            -x[0],  # Score descending
+            x[1].scraped_data.price,  # Price ascending
+            x[1].property_id,  # Property ID ascending
         ),
-        reverse=True,
+        reverse=False,
     )
-
-    # Merge and re-sort so a high-scoring Tier 2 entry can outrank a
-    # low-scoring Tier 1 entry (policy: rank by score across tiers).
-    combined = scored_tier1 + scored_tier2[:needed]
-    combined.sort(
-        key=lambda x: (
-            x[0],
-            -x[1].scraped_data.price if getattr(x[1], "scraped_data", None) and getattr(x[1].scraped_data, "price", None) is not None else 0,
-            getattr(x[1], "property_id", ""),
-        ),
-        reverse=True,
-    )
-    return combined
+    
+    # Smart Tier 1 bias: only re-sort if best Tier 2 >= 90% of best Tier 1
+    top10 = scored_tier1 + scored_tier2[:needed]
+    
+    if scored_tier2 and len(scored_tier2) > 0:
+        best_tier1_score = scored_tier1[0][0] if scored_tier1 else 0.0
+        best_tier2_score = scored_tier2[0][0]
+        
+        # Re-sort to pure merit-based only if Tier 2 is competitive
+        if best_tier1_score > 0 and best_tier2_score >= 0.90 * best_tier1_score:
+            top10.sort(
+                key=lambda x: (
+                    -x[0],  # Score descending
+                    x[1].scraped_data.price,  # Price ascending
+                    x[1].property_id,  # Property ID ascending
+                ),
+                reverse=False,
+            )
+            top10 = top10[:10]
+    
+    return top10
