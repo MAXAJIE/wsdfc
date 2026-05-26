@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import yaml
 
 from . import seeder, ranking_agent, storage
+from .live_filter import build_live_filter
 from .types_quota import MY_REGIONS
 
 logger = logging.getLogger(__name__)
@@ -106,8 +107,15 @@ async def run_pipeline(session_id: str, brief: Dict) -> Dict:
     seeder.reset_flags()  # per-search reset; FLAGS.forced_demo will re-arm on failure
 
     if mode == "realtime":
+        # Build per-session live filter (house_type / bedrooms / budget range)
+        # so the scraper only requests Mudah listings that fit the brief.
+        # Demo path intentionally bypasses this (CSV-replay).
+        live_filter = await build_live_filter(session_id)
+
         async def realtime():
-            return await seeder.fetch_realtime_into_tempo(session_id, regions)
+            return await seeder.fetch_realtime_into_tempo(
+                session_id, regions, live_filter=live_filter,
+            )
         def demo():
             return seeder.load_demo_into_tempo(session_id, regions)
         counts = await seeder.run_with_retry_then_demo(realtime, demo, retries=3)

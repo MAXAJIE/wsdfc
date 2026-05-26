@@ -175,8 +175,15 @@ async def fetch_raw_properties(
     mode = scraper_pipeline._load_mode()
     scraper_storage.clear_session_tempo(session_id)
     if mode == "realtime":
+        # Live-mode filter: only scrape listings matching the brief
+        # (state, property type, budget range, bedrooms, for-sale path).
+        from scraper.live_filter import build_live_filter
+        live_filter = await build_live_filter(session_id)
+
         async def realtime():
-            return await scraper_seeder.fetch_realtime_into_tempo(session_id, regions)
+            return await scraper_seeder.fetch_realtime_into_tempo(
+                session_id, regions, live_filter=live_filter,
+            )
         def demo():
             return scraper_seeder.load_demo_into_tempo(session_id, regions)
         await scraper_seeder.run_with_retry_then_demo(realtime, demo, retries=3)

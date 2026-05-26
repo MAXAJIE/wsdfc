@@ -127,10 +127,23 @@ def load_demo_into_tempo(session_id: str, regions: List[str]) -> Dict[str, int]:
     return counts
 
 
-async def _scrape_one_type_persist(region: str, session_id: str, type_key: str, quota: int) -> int:
-    """Scrape one type, persist into long-term CSV AND session tempo. Returns rows scraped."""
+async def _scrape_one_type_persist(
+    region: str,
+    session_id: str,
+    type_key: str,
+    quota: int,
+    *,
+    filters: Optional[Dict] = None,
+) -> int:
+    """Scrape one type, persist into long-term CSV AND session tempo. Returns rows scraped.
+
+    When `filters` is supplied (live mode), it is forwarded to scrape_region_type
+    so that the Mudah URL carries min_price/max_price/bedrooms and the keyword
+    override. Filters do NOT alter persistence semantics (long-term CSV is still
+    append-only and authoritative).
+    """
     try:
-        rows = await scrape_region_type(region, type_key, quota)
+        rows = await scrape_region_type(region, type_key, quota, filters=filters)
     except Exception as e:
         logger.warning("[realtime] %s/%s scrape raised: %r", region, type_key, e)
         return 0
@@ -141,7 +154,12 @@ async def _scrape_one_type_persist(region: str, session_id: str, type_key: str, 
     return len(rows)
 
 
-async def fetch_realtime_into_tempo(session_id: str, regions: List[str]) -> Dict[str, int]:
+async def fetch_realtime_into_tempo(
+    session_id: str,
+    regions: List[str],
+    *,
+    live_filter: Optional[Dict] = None,
+) -> Dict[str, int]:
     """
     Scrape each region live. Types within a region run concurrently (bounded
     by REGION_TYPE_CONCURRENCY). After each region we re-snapshot tempo from
@@ -151,9 +169,29 @@ async def fetch_realtime_into_tempo(session_id: str, regions: List[str]) -> Dict
     Realtime mode is capped at REALTIME_URL_CAP listing URLs total: once the
     cap is reached, remaining regions are skipped and the ranking agent is
     invoked on whatever has been collected so far.
+
+    `live_filter` (optional) tightens the scrape to the user's brief:
+      - house_type → scrape ONLY that single type (quota=MAX_PER_REGION),
+        instead of fanning out across all TYPE_QUOTA entries.
+      - keyword / bedrooms / min_price / max_price → forwarded into the
+        Mudah URL via mudah_scraper._build_search_url.
+    None / empty filter → original full-type fan-out behaviour.
+
+    If the filtered scrape returns zero rows, the function still re-snapshots
+    tempo from the pre-existing long-term CSV; the upstream expansion_level
+    mechanism (search_pipeline.fetch_raw_properties) is responsible for
+    widening the search when the resulting pool is empty.
     """
     counts: Dict[str, int] = {}
     _URL_BUDGET.init(REALTIME_URL_CAP)
+
+    # Resolve which (type, quota) pairs to scrape per region from the filter.
+    filter_house_type = (live_filter or {}).get("house_type")
+    if filter_house_type and filter_house_type in TYPE_QUOTA:
+        type_plan: List[tuple[str, int]] = [(filter_house_type, MAX_PER_REGION)]
+    else:
+        type_plan = list(TYPE_QUOTA.items())
+
     try:
         for region in regions:
             if _URL_BUDGET.exhausted:
@@ -169,18 +207,26 @@ async def fetch_realtime_into_tempo(session_id: str, regions: List[str]) -> Dict
             pre = storage.load_longterm(region)
             storage.write_tempo(region, session_id, pre)
 
-            if storage.longterm_count(region) >= MAX_PER_REGION:
+            # NOTE: pre-existing rows in long-term CSV were scraped WITHOUT the
+            # current live filter, so a "long-term cache full" short-circuit
+            # would silently bypass the user's filter requirements. When a live
+            # filter is active we always re-hit Mudah for this region.
+            if not live_filter and storage.longterm_count(region) >= MAX_PER_REGION:
                 counts[region] = len(pre)
                 continue
 
             sem = asyncio.Semaphore(REGION_TYPE_CONCURRENCY)
 
-            async def _bounded(t: str, q: int) -> int:
+            async def _bounded(t: str, q: int, _region: str = region) -> int:
+                # `_region` default-arg captures the loop variable to avoid the
+                # classic late-binding bug when `region` rebinds on next iter.
                 async with sem:
-                    return await _scrape_one_type_persist(region, session_id, t, q)
+                    return await _scrape_one_type_persist(
+                        _region, session_id, t, q, filters=live_filter,
+                    )
 
             results = await asyncio.gather(
-                *[_bounded(t, q) for t, q in TYPE_QUOTA.items()],
+                *[_bounded(t, q) for t, q in type_plan],
                 return_exceptions=True,
             )
             total_new = sum(r for r in results if isinstance(r, int))
@@ -190,8 +236,8 @@ async def fetch_realtime_into_tempo(session_id: str, regions: List[str]) -> Dict
             storage.write_tempo(region, session_id, rows)
             counts[region] = len(rows)
             logger.info(
-                "[realtime] %s: +%d new, total=%d, budget_remaining=%d",
-                region, total_new, len(rows), _URL_BUDGET.remaining,
+                "[realtime] %s: +%d new, total=%d, budget_remaining=%d, filter=%s",
+                region, total_new, len(rows), _URL_BUDGET.remaining, live_filter,
             )
     finally:
         # Always disable the budget so non-realtime / subsequent runs are

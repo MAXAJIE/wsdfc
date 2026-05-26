@@ -133,9 +133,43 @@ async def _playwright_get(url: str) -> str:
 
 
 # ── parsing ──────────────────────────────────────────────────────────
-def _build_search_url(region: str, type_key: str, page: int) -> str:
-    kw = quote_plus(TYPE_SEARCH_KEYWORD[type_key])
-    return f"{HOST}{LIST_PATH_TEMPLATE.format(region=region)}?q={kw}&o={page}"
+def _build_search_url(
+    region: str,
+    type_key: str,
+    page: int,
+    *,
+    filters: Optional[Dict] = None,
+) -> str:
+    """
+    Construct a Mudah listing-page search URL.
+
+    `filters` (optional, all keys individually optional — partial fill is fine):
+      - keyword   : overrides the per-type `q=` keyword
+      - bedrooms  : int → ?bedrooms=N
+      - min_price : float → ?min_price=N (rounded int, MYR)
+      - max_price : float → ?max_price=N (rounded int, MYR)
+
+    Verified against live Mudah responses on 2026-05-26:
+        ?q=, &min_price=, &max_price=, &bedrooms=, &o= (page)
+    Unknown / unverified params are NEVER attached.
+    """
+    f = filters or {}
+    kw_raw = f.get("keyword") or TYPE_SEARCH_KEYWORD[type_key]
+    parts: list[str] = [f"q={quote_plus(str(kw_raw))}", f"o={page}"]
+
+    bedrooms = f.get("bedrooms")
+    if isinstance(bedrooms, int) and bedrooms > 0:
+        parts.append(f"bedrooms={bedrooms}")
+
+    for k_src, k_url in (("min_price", "min_price"), ("max_price", "max_price")):
+        v = f.get(k_src)
+        try:
+            if v is not None and float(v) > 0:
+                parts.append(f"{k_url}={int(round(float(v)))}")
+        except (TypeError, ValueError):
+            pass
+
+    return f"{HOST}{LIST_PATH_TEMPLATE.format(region=region)}?" + "&".join(parts)
 
 
 def _extract_listing_urls(html: str) -> List[str]:
@@ -404,6 +438,7 @@ async def scrape_region_type(
     target_count: int,
     *,
     on_progress: Optional[Callable[[str], Awaitable[None]]] = None,
+    filters: Optional[Dict] = None,
 ) -> List[Dict]:
     if target_count <= 0:
         return []
@@ -425,7 +460,7 @@ async def scrape_region_type(
                 break
             if BUDGET.exhausted:
                 break
-            url = _build_search_url(region, type_key, page)
+            url = _build_search_url(region, type_key, page, filters=filters)
             html: Optional[str] = None
             try:
                 async with host_sem:
