@@ -271,6 +271,31 @@ class ChatOpeningRequest(BaseModel):
     client_context: dict | None = None
 
 
+# ─── Conflict-dedup helpers (used by /chat and /update_requirements) ──
+# Multiple field names in the LLM prompt refer to the same user intent
+# ("location" vs "specific_location"). Canonicalize both sides before
+# comparing so a confirmed change to one alias suppresses a duplicate
+# conflict raised under the other.
+_FIELD_ALIAS_CANON: dict[str, str] = {
+    "location": "specific_location",
+    "specific_location": "specific_location",
+}
+
+
+def _canon_field(field: "str | None") -> "str | None":
+    if not field:
+        return field
+    return _FIELD_ALIAS_CANON.get(field, field)
+
+
+def _norm_value(v):
+    """Loose equality for conflict dedup: strings are trimmed and
+    case-folded; everything else compared as-is."""
+    if isinstance(v, str):
+        return v.strip().casefold()
+    return v
+
+
 def _extract_phase2_facts(dialogue_session) -> list[str]:
     """Deterministically scan all user messages in this Phase 2 session and
     extract structured facts (bedrooms, bathrooms, location, financing,
@@ -569,6 +594,18 @@ reply 寫一句承上啟下的話（例「資料齊全了，我這就為您挑�
         if f not in confirmed_facts:
             confirmed_facts.append(f)
 
+    # Session-scoped confirmed_overrides (written by /update_requirements
+    # after the user accepts a ConflictCard) are authoritative. Surface
+    # them here so the LLM stops raising a fresh conflict for a value
+    # the user has already confirmed earlier in the session.
+    overrides = getattr(dialogue_session, "confirmed_overrides", {}) or {}
+    for k, v in overrides.items():
+        line = f"{k} = {v}"
+        if line not in confirmed_facts:
+            confirmed_facts.append(line)
+
+
+
     if confirmed_facts or instruction:
         facts_block = "\n".join(f"- {f}" for f in confirmed_facts)
         system_prompt += (
@@ -656,12 +693,34 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
 
         # Determine response status
         if llm_output.conflict_detected:
+            # Conflict dedup: if the user has already accepted this exact
+            # (field, value) via /update_requirements earlier in the
+            # session, do NOT pop a second ConflictCard — downgrade the
+            # response to plain "chatting" so the frontend renders the
+            # reply (which the LLM typically follows with the next
+            # question) as a normal assistant turn.
+            overrides = getattr(
+                dialogue_session, "confirmed_overrides", {}
+            ) or {}
+            canon = _canon_field(llm_output.conflicting_field)
+            if (
+                canon
+                and canon in overrides
+                and _norm_value(overrides[canon])
+                == _norm_value(llm_output.proposed_value)
+            ):
+                return ChatResponse(
+                    status="chatting",
+                    reply=llm_output.reply,
+                    fc_attempt=dialogue_session.fc_trigger_attempts,
+                )
             return ChatResponse(
                 status="pending_confirmation",
                 reply=llm_output.reply,
                 conflicting_field=llm_output.conflicting_field,
                 proposed_value=llm_output.proposed_value,
             )
+
 
         if llm_output.fc_trigger:
             # Check attempt limit. Hard cap at MAX_FC_ATTEMPTS to stop a
@@ -993,6 +1052,15 @@ async def update_requirements(request: UpdateRequirementsRequest):
     for field, value in request.updated_fields.items():
         if hasattr(dialogue_session.phase1_data, field):
             setattr(dialogue_session.phase1_data, field, value)
+        # Always record the accepted value into the session-scoped
+        # override map. Phase 2 fields (location, bedrooms, bathrooms,
+        # …) are NOT declared on Phase1Data, so the hasattr branch
+        # above silently no-ops for them — without this we would lose
+        # the user's confirmation and the LLM would raise the same
+        # conflict on the very next turn.
+        canon = _canon_field(field) or field
+        dialogue_session.confirmed_overrides[canon] = value
+
 
     # Reset search session and clear rejected properties
     reset_search_session(request.session_id)

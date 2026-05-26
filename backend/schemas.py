@@ -78,6 +78,13 @@ class DialogueSession(BaseModel):
     phase1_data: Phase1Data
     dialogue_history: list[DialogueMessage] = Field(default_factory=list)
     fc_trigger_attempts: int = 0
+    # Session-scoped record of values the user has explicitly confirmed
+    # through the conflict flow (POST /api/v1/update_requirements). Keys
+    # are canonical field names (see _canon_field in main.py); values are
+    # the accepted user value. Used by /chat to deduplicate a second
+    # ConflictCard for the same (field, value) pair, and by the Phase 2
+    # system prompt to treat the override as authoritative KNOWN FACTS.
+    confirmed_overrides: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ─── LLM Chat Output ───────────────────────────────────────────────

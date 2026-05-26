@@ -153,6 +153,16 @@ def keep_memories_reset(session_id: str) -> None:
     reset_search_session(session_id)
 
 
+def clear_all_in_memory_sessions() -> None:
+    """
+    Clear all in-memory sessions. Called on backend startup to invalidate
+    any sessions from previous runs.
+    """
+    _dialogue_sessions.clear()
+    _npp_sessions.clear()
+    _search_sessions.clear()
+
+
 def add_dialogue_message(session_id: str, role: str, content: str) -> None:
     """Add message to dialogue history."""
     dialogue_session = get_dialogue_session(session_id)

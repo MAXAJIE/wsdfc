@@ -121,6 +121,13 @@ interface AppStore {
   pendingConflict: PendingConflict | null;
   setPendingConflict: (p: PendingConflict | null) => void;
 
+  // Session-scoped record of values the user has explicitly confirmed
+  // through the ConflictCard. Keys are canonical field names (see
+  // canonField in Conversation.tsx). Used to suppress a second
+  // ConflictCard for the same (field, value) in the same session.
+  confirmedOverrides: Record<string, unknown>;
+  setConfirmedOverride: (field: string, value: unknown) => void;
+
   // Search progress
   searchStage: SearchStage | null;
   setSearchStage: (s: SearchStage | null) => void;
@@ -243,6 +250,12 @@ export const useAppStore = create<AppStore>((set, get) => {
     pendingConflict: null,
     setPendingConflict: (p) => set({ pendingConflict: p }),
 
+    confirmedOverrides: {},
+    setConfirmedOverride: (field, value) =>
+      set((st) => ({
+        confirmedOverrides: { ...st.confirmedOverrides, [field]: value },
+      })),
+
     searchStage: null,
     setSearchStage: (s) => set({ searchStage: s }),
 
@@ -295,6 +308,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         alignmentError: null,
         dialogueMessages: [],
         pendingConflict: null,
+        confirmedOverrides: {},
         searchStage: null,
         rejectionCount: 0,
         rejectedIds: [],

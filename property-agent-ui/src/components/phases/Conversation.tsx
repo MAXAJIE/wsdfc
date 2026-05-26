@@ -13,6 +13,18 @@ const FIELD_KEYS = [
   "house_type", "location", "description", "bedrooms", "bathrooms",
 ] as const;
 
+// LLM may emit either "location" or "specific_location" for the same
+// user intent. Canonicalize before comparing against confirmedOverrides
+// so an accepted change to one alias suppresses a duplicate ConflictCard
+// raised under the other.
+const FIELD_ALIAS_CANON: Record<string, string> = {
+  location: "specific_location",
+  specific_location: "specific_location",
+};
+const canonField = (f: string): string => FIELD_ALIAS_CANON[f] ?? f;
+const normVal = (v: unknown): unknown =>
+  typeof v === "string" ? v.trim().toLowerCase() : v;
+
 function fieldLabel(field: string, lang: Lang): string {
   return (FIELD_KEYS as readonly string[]).includes(field)
     ? t(`field.${field}`, lang)
@@ -38,6 +50,8 @@ export function Conversation() {
   const appendMessage = useAppStore((s) => s.appendMessage);
   const pendingConflict = useAppStore((s) => s.pendingConflict);
   const setPendingConflict = useAppStore((s) => s.setPendingConflict);
+  const confirmedOverrides = useAppStore((s) => s.confirmedOverrides);
+  const setConfirmedOverride = useAppStore((s) => s.setConfirmedOverride);
   const phase1Form = useAppStore((s) => s.phase1Form);
   const semanticTags = useAppStore((s) => s.semanticTags);
   const lang = useAppStore((s) => s.lang);
@@ -213,12 +227,26 @@ export function Conversation() {
         const res = await api.chat(sessionId, text, chatContext ?? undefined);
         appendMessage({ role: "assistant", content: res.reply });
         if (res.status === "pending_confirmation") {
-          setPendingConflict({
-            conflicting_field: res.conflicting_field ?? "",
-            proposed_value: res.proposed_value,
-            reply: res.reply,
-          });
-          setAppState("PENDING_CONFIRMATION");
+          // Dedup: if the user already confirmed the exact same
+          // (canonical-field, value) earlier in this session, do NOT
+          // open a second ConflictCard. The backend performs the same
+          // check; this is a belt-and-suspenders client-side guard so
+          // a stale backend still cannot pop a duplicate.
+          const rawField = res.conflicting_field ?? "";
+          const canon = canonField(rawField);
+          const prevAccepted = confirmedOverrides[canon];
+          const alreadyAccepted =
+            rawField !== "" &&
+            prevAccepted !== undefined &&
+            normVal(prevAccepted) === normVal(res.proposed_value);
+          if (!alreadyAccepted) {
+            setPendingConflict({
+              conflicting_field: rawField,
+              proposed_value: res.proposed_value,
+              reply: res.reply,
+            });
+            setAppState("PENDING_CONFIRMATION");
+          }
         } else if (res.status === "searching") {
           setAppState("SEARCHING");
         }
@@ -273,6 +301,10 @@ export function Conversation() {
         await api.updateRequirements(sessionId, {
           [field]: pendingConflict.proposed_value,
         });
+        // Record the acceptance so a subsequent /chat turn that raises
+        // the same conflict (e.g. LLM emits the alias field name) is
+        // silently dropped instead of popping a second ConflictCard.
+        setConfirmedOverride(canonField(field), pendingConflict.proposed_value);
         appendMessage({
           role: "assistant",
           content: t("p2.conflict.msg.updated", lang, {
