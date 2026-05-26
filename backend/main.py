@@ -46,6 +46,7 @@ from session_manager import (
     keep_memories_reset,
     reset_search_session,  # FIX B4: was missing — caused NameError in update_requirements
     update_semantic_tags,
+    clear_all_in_memory_sessions,
 )
 from llm_client import llm_client
 from search_pipeline import execute_search_pipeline
@@ -55,7 +56,6 @@ from scraper.pipeline import run_pipeline as run_scraper_pipeline
 BACKEND_BOOT_ID = str(uuid.uuid4())
 
 import re
-import sys
 
 # (Event-loop policy already set at module top before any other import.)
 
@@ -83,6 +83,9 @@ app.add_middleware(
 async def _wipe_tempo_on_startup() -> None:
     _scraper_storage.clear_all_tempo()
     _scraper_seeder.reset_flags()
+    clear_all_in_memory_sessions()
+
+app.add_event_handler("startup", _wipe_tempo_on_startup)
 
 
 # ─── 4.0 GET /api/v1/system_status — frontend popup gate ─────────────
@@ -747,7 +750,7 @@ async def chat_opening(request: ChatOpeningRequest):
         "[SYSTEM_KICKOFF] 對話即將開始。請依據上方 Phase 1 已確認資料與 KNOWN FACTS，"
         "用一句簡短的歡迎語自我介紹，然後立刻提出『必填細節』中尚未明朗、"
         "對搜索最關鍵的 1 個問題。輸出仍須嚴格遵守 JSON 格式；"
-        "禁止重複追問任何 confirmed_facts；禁止觸發 fc_trigger。"
+        "禁止重複詢問任何 confirmed_facts；禁止觸發 fc_trigger。"
     )
 
     messages = [

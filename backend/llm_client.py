@@ -157,7 +157,8 @@ class LLMClient:
                 print(f"LLM output validation failed: {e}")
                 raise
             except Exception as e:
-                print(f"LLM call failed: {e}")
+                import traceback
+                print(f"LLM call failed: {e}\n{traceback.format_exc()}")
                 raise
 
     async def complete_json(self, messages: list[dict], model: str = LLM_MODEL) -> dict:
@@ -167,15 +168,20 @@ class LLMClient:
         than the ChatLLMOutput schema.
         """
         async with llm_semaphore:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": 800,
-                "response_format": {"type": "json_object"},
-            }
-            response = await self._call_api(payload)
-            content = response["choices"][0]["message"]["content"]
-            return json.loads(content)
+            try:
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 800,
+                    "response_format": {"type": "json_object"},
+                }
+                response = await self._call_api(payload)
+                content = response["choices"][0]["message"]["content"]
+                return json.loads(content)
+            except Exception as e:
+                import traceback
+                print(f"LLM complete_json call failed: {e}\n{traceback.format_exc()}")
+                raise
 
     def _normalize_tags_to_enum(
         self,
