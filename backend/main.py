@@ -13,11 +13,11 @@ if _sys.platform == "win32" and hasattr(_asyncio_boot, "WindowsProactorEventLoop
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 import asyncio
+import httpx  # for exception types
 import json as _json
 from fastapi.middleware.cors import CORSMiddleware
 import uuid
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from schemas import (
     Phase1Data,
@@ -676,17 +676,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     messages.insert(0, {"role": "system", "content": system_prompt})
 
     try:
-        # Call LLM for structured output with retry logic
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=1, max=10),
-            retry=retry_if_exception_type(Exception), # Retry on any exception from LLM client
-            reraise=True,
-        )
-        async def call_llm_with_retry():
-            return await llm_client.chat(messages)
-
-        llm_output = await call_llm_with_retry()
+        # C6: endpoint-level retry removed. llm_client._call_api already
+        # retries (3x) with backoff on transport / 5xx / 429 errors only.
+        # Transport errors here are mapped to 502 below.
+        try:
+            llm_output = await llm_client.chat(messages)
+        except (httpx.HTTPError, asyncio.TimeoutError) as _e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM unavailable: {type(_e).__name__}: {_e}",
+            )
 
         # Add assistant response to history
         add_dialogue_message(request.session_id, "assistant", llm_output.reply)
@@ -864,8 +863,12 @@ async def search_status(session_id: str):
             total_available=total,
             has_more=has_more,
             tier3_triggered=False,
-            degraded=False,
+            degraded=bool(
+                getattr(search_session, "llm_filter_degraded", False)
+                or _scraper_seeder.FLAGS.forced_demo
+            ),
             results=batch_results,
+            remarks=build_remarks_for_batch(search_session, batch_results),
         )
 
     # CRIT-2: when stage is "idle" (pipeline not yet scheduled), report idle
@@ -903,8 +906,12 @@ async def next_batch(request: NextBatchRequest):
         total_available=total,
         has_more=has_more,
         tier3_triggered=False,
-        degraded=False,
+        degraded=bool(
+            getattr(search_session, "llm_filter_degraded", False)
+            or _scraper_seeder.FLAGS.forced_demo
+        ),
         results=batch_results or [],
+        remarks=build_remarks_for_batch(search_session, batch_results or []),
     )
 
 

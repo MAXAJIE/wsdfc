@@ -149,6 +149,7 @@ class SearchSession(BaseModel):
     # /search_status and /next_batch never surfaced the AI commentary.
     # Persist them keyed by property_id and slice alongside each batch.
     remarks_by_id: dict[str, PropertyRemark] = Field(default_factory=dict)
+    llm_filter_degraded: bool = False
     rejected_property_ids: list[str] = Field(default_factory=list)
     search_stage: Literal["idle", "scraping", "ranking", "generating_remarks", "complete"] = "idle"
 

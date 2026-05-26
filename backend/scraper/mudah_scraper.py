@@ -966,45 +966,38 @@ def _parse_detail(html: str, url: str, region: str, type_key: str) -> Dict:
 
 
 async def _populate_playwright_fields(detail: Dict, url: str) -> Dict:
-    """Asynchronously populate Playwright-gated fields."""
-    try:
-        # Get agent phone
-        phone = await _playwright_click_reveal_phone_async(url)
-        if phone:
-            detail["agent_phone"] = phone
-    except Exception:
-        pass
+    """Asynchronously populate Playwright-gated fields.
 
-    try:
-        # Get agent WhatsApp
-        whatsapp = await _playwright_click_reveal_whatsapp_async(url)
-        if whatsapp:
-            detail["agent_whatsapp"] = whatsapp
-    except Exception:
-        pass
-
-    try:
-        # Get full-res gallery images
-        gallery_imgs = await _playwright_click_gallery_images_async(url)
-        if gallery_imgs and (not detail.get("image_urls") or len(gallery_imgs) > len(detail.get("image_urls", []))):
-            detail["image_urls"] = gallery_imgs
-            detail["image_count"] = len(gallery_imgs)
-    except Exception:
-        pass
-
-    try:
-        # Get amenities
-        amenities = await _playwright_extract_amenities_async(url)
-        if amenities:
-            detail["facilities_list"] = amenities.get("facilities_list")
-            detail["nearby_bus_stops"] = amenities.get("nearby_bus_stops")
-            detail["nearby_schools"] = amenities.get("nearby_schools")
-            detail["nearby_parks"] = amenities.get("nearby_parks")
-            detail["nearby_hospitals"] = amenities.get("nearby_hospitals")
-            detail["nearby_shopping"] = amenities.get("nearby_shopping")
-    except Exception:
-        pass
-
+    OPTIMIZED: the 4 independent Playwright calls run concurrently via
+    asyncio.gather instead of serially. Per-property latency drops from
+    ~4×browser_boot to ~1×browser_boot. Any individual task failure is
+    swallowed (return_exceptions=True) — partial data is still useful.
+    """
+    phone, whatsapp, gallery_imgs, amenities = await asyncio.gather(
+        _playwright_click_reveal_phone_async(url),
+        _playwright_click_reveal_whatsapp_async(url),
+        _playwright_click_gallery_images_async(url),
+        _playwright_extract_amenities_async(url),
+        return_exceptions=True,
+    )
+    if isinstance(phone, str) and phone:
+        detail["agent_phone"] = phone
+    if isinstance(whatsapp, str) and whatsapp:
+        detail["agent_whatsapp"] = whatsapp
+    if isinstance(gallery_imgs, list) and gallery_imgs and (
+        not detail.get("image_urls")
+        or len(gallery_imgs) > len(detail.get("image_urls", []))
+    ):
+        detail["image_urls"] = gallery_imgs
+        detail["image_count"] = len(gallery_imgs)
+    if isinstance(amenities, dict) and amenities:
+        for k in (
+            "facilities_list", "nearby_bus_stops", "nearby_schools",
+            "nearby_parks", "nearby_hospitals", "nearby_shopping",
+        ):
+            v = amenities.get(k)
+            if v is not None:
+                detail[k] = v
     return detail
 
 
@@ -1090,8 +1083,20 @@ async def scrape_region_type(
                 detail = _parse_detail(html_, u, region, type_key)
                 # Populate Playwright-gated fields
                 detail = await _populate_playwright_fields(detail, u)
+                # Per-property observability (replaces silent 200 OK only).
+                try:
+                    print(
+                        f"[scrape] region={region} url={u} "
+                        f"title={(detail.get('title') or '')[:60]!r} "
+                        f"price={detail.get('price')} "
+                        f"bedrooms={detail.get('bedrooms')}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
                 return detail
-            except Exception:
+            except Exception as _e:
+                print(f"[scrape] PARSE_FAIL url={u} err={type(_e).__name__}: {_e}", flush=True)
                 return None
 
         slice_n = len(listing_urls) if BUDGET.enabled else (target_count + 20)

@@ -185,6 +185,16 @@ async def fetch_raw_properties(
         from scraper.live_filter import build_live_filter
         live_filter = await build_live_filter(session_id)
 
+        # C5: live_filter may carry a `_llm_degraded` marker meaning the
+        # LLM-augment leg failed and we fell back to regex-only extraction.
+        # Surface it on the SearchSession so the API layer (and frontend)
+        # can warn the user that the live filter is degraded.
+        if live_filter.pop("_llm_degraded", False):
+            try:
+                search_session.llm_filter_degraded = True
+            except Exception:
+                pass
+
         async def realtime():
             return await scraper_seeder.fetch_realtime_into_tempo(
                 session_id, regions, live_filter=live_filter,

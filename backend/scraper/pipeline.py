@@ -35,6 +35,23 @@ def _load_mode() -> str:
     return mode
 
 
+def _load_realtime_budget_seconds() -> int:
+    """Per-region wall-clock budget for realtime scraping (0 = use default).
+
+    Decision (v2 patch): per-region budget. Reaching it aborts in-flight detail
+    fetches for THAT region and the pipeline continues to the next region with
+    whatever has already been collected. Session-wide total = N_regions × budget.
+    Tune in backend/config.yaml under `scraper.realtime_budget_seconds`.
+    """
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        v = (cfg.get("scraper") or {}).get("realtime_budget_seconds", 0)
+        return int(v) if v else 0
+    except Exception:
+        return 0
+
+
 # Alias table: Chinese / Malay / common English variants → canonical region key.
 REGION_ALIASES: Dict[str, List[str]] = {
     "johor":           ["johor", "柔佛", "jb", "johor bahru", "johor-bahru"],
@@ -107,6 +124,15 @@ async def run_pipeline(session_id: str, brief: Dict) -> Dict:
     seeder.reset_flags()  # per-search reset; FLAGS.forced_demo will re-arm on failure
 
     if mode == "realtime":
+        # v2: honor optional per-region wall-clock budget from config.yaml.
+        budget = _load_realtime_budget_seconds()
+        if budget > 0:
+            try:
+                from . import mudah_scraper as _ms
+                _ms.GLOBAL_DEADLINE_SEC = budget
+                logger.info("[pipeline] realtime per-region budget=%ds", budget)
+            except Exception as e:
+                logger.warning("[pipeline] failed to apply budget: %s", e)
         # Build per-session live filter (house_type / bedrooms / budget range)
         # so the scraper only requests Mudah listings that fit the brief.
         # Demo path intentionally bypasses this (CSV-replay).

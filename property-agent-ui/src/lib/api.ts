@@ -214,6 +214,17 @@ export const api = {
   rejectAll: (sessionId: string) =>
     postJSON<RejectAllResponse>("/reject_all", { session_id: sessionId }),
 
+  reasonDislike: (
+    sessionId: string,
+    property_id: string,
+    reason: string,
+  ) =>
+    postJSON<ReasonDislikeResponse>("/reason_dislike", {
+      session_id: sessionId,
+      property_id,
+      reason,
+    }),
+
   resolveAction: (sessionId: string, action: "new_prompt" | "keep_memories") =>
     postJSON<{ status: string; reply?: string }>("/resolve_action", {
       session_id: sessionId,

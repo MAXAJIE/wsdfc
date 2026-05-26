@@ -14,3 +14,7 @@ llm:
 scraper:
   mode: "realtime"
   retries: 3
+  # Hard wall-clock per region (overrides scraper GLOBAL_DEADLINE_SEC).
+  # Reaching this aborts in-flight detail fetches for the region and uses
+  # whatever has been collected so far. 0 = use scraper default (180s).
+  realtime_budget_seconds: 90

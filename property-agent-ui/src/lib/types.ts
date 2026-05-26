@@ -151,3 +151,11 @@ export interface UpdateRequirementsResponse {
   search_session_reset: boolean;
   rejected_property_ids_cleared: boolean;
 }
+
+export interface ReasonDislikeResponse {
+  add_npp: string[];
+  remove_ppp: string[];
+  add_ppp: string[];
+  rationale: string;
+  applied: boolean;
+}

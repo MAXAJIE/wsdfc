@@ -147,7 +147,7 @@ async def _llm_augment(text: str, regex_hint: Dict[str, Any]) -> Dict[str, Any]:
         from llm_client import llm_client  # type: ignore
     except Exception as e:
         logger.info("[live_filter] llm_client unavailable (%s)", e)
-        return {}
+        return {"_degraded": True}
 
     allowed = list(TYPE_QUOTA.keys())
     system = (
@@ -169,7 +169,7 @@ async def _llm_augment(text: str, regex_hint: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception as e:
         logger.warning("[live_filter] LLM call failed: %s", e)
-        return {}
+        return {"_degraded": True}
     if not isinstance(parsed, dict):
         return {}
 
@@ -200,6 +200,7 @@ async def build_live_filter(session_id: str) -> Dict[str, Any]:
     if regex_hint["house_type"] is None or regex_hint["bedrooms"] is None:
         llm_hint = await _llm_augment(text, regex_hint)
 
+    _degraded = bool(llm_hint.get("_degraded"))
     house_type: Optional[str] = regex_hint["house_type"] or llm_hint.get("house_type")
     bedrooms:   Optional[int] = regex_hint["bedrooms"]   or llm_hint.get("bedrooms")
 
@@ -216,5 +217,8 @@ async def build_live_filter(session_id: str) -> Dict[str, Any]:
     if hi is not None:
         out["max_price"] = hi
 
+    if _degraded:
+        out["_llm_degraded"] = True
+        logger.warning("[live_filter] LLM augment degraded → regex-only filter")
     logger.info("[live_filter] session=%s resolved=%s", session_id, out)
     return out

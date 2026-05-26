@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   MapPin,
   Banknote,
@@ -14,6 +14,7 @@ import type { PropertyResult } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, type Lang } from "@/lib/i18n";
+import { toast } from "sonner";
 
 export function ResultsBatch() {
   const lang = useAppStore((s) => s.lang);
@@ -30,6 +31,17 @@ export function ResultsBatch() {
   const setRejectionCount = useAppStore((s) => s.setRejectionCount);
   const addRejectedId = useAppStore((s) => s.addRejectedId);
   const setAppState = useAppStore((s) => s.setAppState);
+
+  // C5: toast once when the LLM-augmented live filter degrades to regex-only.
+  const degradedToastedRef = useRef(false);
+  useEffect(() => {
+    if (degraded && !degradedToastedRef.current) {
+      degradedToastedRef.current = true;
+      toast.warning(t("results.degraded", lang), {
+        description: "AI 智能过滤暂时不可用，本次搜索使用基础规则过滤。",
+      });
+    }
+  }, [degraded, lang]);
 
   const fetchNext = async () => {
     if (!sessionId) return;
@@ -48,6 +60,24 @@ export function ResultsBatch() {
     try {
       const data = await api.rejectSingle(sessionId, propertyId, reason);
       setRejectionCount(data.rejection_count);
+
+      // C2: phase-3 dislike reasoning. Fire-and-forget; surface rationale
+      // back to the user so they SEE what the system learned.
+      if (reason.trim()) {
+        api
+          .reasonDislike(sessionId, propertyId, reason)
+          .then((r) => {
+            if (!r.applied) return;
+            const parts: string[] = [];
+            if (r.add_npp?.length) parts.push("− " + r.add_npp.join(", "));
+            if (r.remove_ppp?.length) parts.push("× " + r.remove_ppp.join(", "));
+            if (r.add_ppp?.length) parts.push("+ " + r.add_ppp.join(", "));
+            toast.success(r.rationale || "Preferences updated", {
+              description: parts.join("   "),
+            });
+          })
+          .catch((e) => console.warn("[reasonDislike] failed", e));
+      }
       if (data.rejection_count >= totalAvailable && totalAvailable > 0) {
         setAppState("ALL_REJECTED");
         try {
