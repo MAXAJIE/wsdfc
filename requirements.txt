@@ -25,3 +25,4 @@ chromium
 fastapi
 lxml
 tenacity
+curl_cffi>=0.7.0

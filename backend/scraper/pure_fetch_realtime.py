@@ -268,7 +268,8 @@ async def run_pure_fetch_realtime(
         await asyncio.gather(*[_do_region(r) for r in regions], return_exceptions=True)
     finally:
         try:
-            await shared_client.aclose()
+            # curl_cffi's AsyncSession exposes close(), not aclose() (httpx API).
+            await shared_client.close()
         except Exception:
             pass
 
