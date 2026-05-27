@@ -31,8 +31,21 @@ MAX_PAGES_PER_QUERY = 8
 PER_HOST_CONCURRENCY = 8
 DETAIL_CONCURRENCY = 12
 REQUEST_TIMEOUT = 20.0
-GLOBAL_DEADLINE_SEC = 180
+# Per (region, type) wall-clock budget. Realistic detail-page fan-out with
+# 3-retry-then-Playwright mandatory-field loop needs more headroom than the
+# original 180s; cells were timing out before any complete row was written.
+GLOBAL_DEADLINE_SEC = 600
 RETRY_ATTEMPTS = 3
+
+# ── Mandatory-field policy ───────────────────────────────────────────
+# Per user spec: bedrooms, price, area (location), size_sqft, bathrooms,
+# description MUST be present. A listing missing ANY of these is dropped
+# in BOTH realtime and pure_fetch modes (set enforce_mandatory=False to
+# bypass for debug/QA).
+MANDATORY_FIELDS = ("bedrooms", "price", "area", "size_sqft", "bathrooms", "description")
+# Max attempts per detail URL: 3× curl_cffi with rotated UA, then 1×
+# Playwright bottom-up render. Total ≤ 4 fetches.
+DETAIL_MAX_CURL_ATTEMPTS = 3
 
 # HTML parser used across this module. `lxml` is materially faster than
 # `html.parser` on Mudah's ~250 KB detail pages and is required for the
@@ -1025,6 +1038,22 @@ def make_shared_client() -> AsyncSession:
     )
 
 
+def _is_complete(detail: Optional[Dict]) -> bool:
+    """True iff every mandatory field is present and non-empty.
+    `area` here implements the user-chosen LOCATION definition (option B:
+    `area` must be non-empty). Strings are stripped; numbers (0 included)
+    count as present — Mudah never publishes 0-bedroom listings anyway."""
+    if not isinstance(detail, dict):
+        return False
+    for f in MANDATORY_FIELDS:
+        v = detail.get(f)
+        if v is None:
+            return False
+        if isinstance(v, str) and not v.strip():
+            return False
+    return True
+
+
 async def scrape_region_type(
         region: str,
         type_key: str,
@@ -1033,11 +1062,25 @@ async def scrape_region_type(
         on_progress: Optional[Callable[[str], Awaitable[None]]] = None,
         filters: Optional[Dict] = None,
         skip_playwright: bool = False,
+        enforce_mandatory: bool = True,
         client: Optional[AsyncSession] = None,
 ) -> List[Dict]:
-    """Scrape one (region,type). `skip_playwright=True` disables the
-    per-property phone/whatsapp/gallery/amenities augmentation, trading
-    completeness for a 5–10× speedup (used by `pure_fetch` mode)."""
+    """Scrape one (region,type).
+
+    Per-detail fetch strategy (enforce_mandatory=True, default):
+      1..3: curl_cffi GET with rotated UA. Parse. Keep if all 6 mandatory
+            fields present, else small backoff and retry with a new UA.
+      4:    Playwright bottom-up render (one chromium boot, full DOM).
+            Parse. Keep if complete, else DROP.
+
+    `skip_playwright=True` disables the per-property phone/whatsapp/
+    gallery/amenities AUGMENTATION (used by pure_fetch for speed), but
+    Playwright is still used as the 4th mandatory-field retry per the
+    user-chosen retry policy (3 curl + 1 Playwright = 4 attempts).
+
+    `enforce_mandatory=False` returns every parsed row regardless of
+    completeness (debug / golden-fixture path).
+    """
     if target_count <= 0:
         return []
 
@@ -1047,12 +1090,11 @@ async def scrape_region_type(
     host_sem = asyncio.Semaphore(PER_HOST_CONCURRENCY)
     detail_sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
 
-    use_playwright = False
+    list_use_playwright = False
     collected: List[Dict] = []
+    dropped_incomplete = 0
     seen_urls: set[str] = set()
 
-    # Reuse the caller-supplied client when given; otherwise mint a per-call
-    # HTTP/2 client. Ownership: we only close the client we created ourselves.
     _owned = client is None
     _client = client or make_shared_client()
     try:
@@ -1068,7 +1110,7 @@ async def scrape_region_type(
                 async with host_sem:
                     html = await _get(_client, url)
             except ScraperBanned:
-                use_playwright = True
+                list_use_playwright = True
                 try:
                     html = await _playwright_get(url)
                 except Exception:
@@ -1079,6 +1121,11 @@ async def scrape_region_type(
                 continue
             urls = _extract_listing_urls(html)
             new = [u for u in urls if u not in seen_urls]
+            print(
+                f"[scrape] list region={region} type={type_key} page={page} "
+                f"extracted={len(urls)} new={len(new)} (running_total={len(listing_urls) + len(new)})",
+                flush=True,
+            )
             if not new:
                 break
             grant = await BUDGET.reserve(len(new))
@@ -1095,42 +1142,69 @@ async def scrape_region_type(
             if not BUDGET.enabled and len(listing_urls) >= target_count * 2:
                 break
 
-        async def fetch_one(u: str) -> Optional[Dict]:
-            if time.monotonic() > deadline:
-                return None
+        async def _fetch_html_once(u: str, *, force_playwright: bool) -> Optional[str]:
             try:
                 async with detail_sem:
-                    if use_playwright:
-                        html_ = await _playwright_get(u)
-                    else:
-                        html_ = await _get(_client, u)
+                    if force_playwright or list_use_playwright:
+                        return await _playwright_get(u)
+                    return await _get(_client, u)
             except ScraperBanned:
                 try:
-                    html_ = await _playwright_get(u)
+                    return await _playwright_get(u)
                 except Exception:
                     return None
             except Exception:
                 return None
-            try:
-                detail = _parse_detail(html_, u, region, type_key)
-                # Populate Playwright-gated fields (skipped in pure_fetch mode).
-                if not skip_playwright:
-                    detail = await _populate_playwright_fields(detail, u)
-                # Per-property observability (replaces silent 200 OK only).
+
+        async def fetch_one(u: str) -> Optional[Dict]:
+            best: Optional[Dict] = None
+            for attempt in range(1, DETAIL_MAX_CURL_ATTEMPTS + 1):
+                if time.monotonic() > deadline:
+                    return None
+                html_ = await _fetch_html_once(u, force_playwright=False)
+                if not html_:
+                    continue
                 try:
-                    print(
-                        f"[scrape] region={region} url={u} "
-                        f"title={(detail.get('title') or '')[:60]!r} "
-                        f"price={detail.get('price')} "
-                        f"bedrooms={detail.get('bedrooms')}",
-                        flush=True,
-                    )
+                    detail = _parse_detail(html_, u, region, type_key)
+                except Exception as _e:
+                    print(f"[scrape] PARSE_FAIL url={u} err={type(_e).__name__}: {_e}", flush=True)
+                    continue
+                best = detail
+                if not enforce_mandatory or _is_complete(detail):
+                    break
+                await asyncio.sleep(0.4 * attempt + random.random() * 0.3)
+            if enforce_mandatory and (best is None or not _is_complete(best)):
+                if time.monotonic() <= deadline:
+                    html_ = await _fetch_html_once(u, force_playwright=True)
+                    if html_:
+                        try:
+                            best = _parse_detail(html_, u, region, type_key)
+                        except Exception as _e:
+                            print(f"[scrape] PARSE_FAIL(pw) url={u} err={type(_e).__name__}: {_e}", flush=True)
+            if best is None:
+                return None
+            if not skip_playwright:
+                try:
+                    best = await _populate_playwright_fields(best, u)
                 except Exception:
                     pass
-                return detail
-            except Exception as _e:
-                print(f"[scrape] PARSE_FAIL url={u} err={type(_e).__name__}: {_e}", flush=True)
+            try:
+                print(
+                    f"[scrape] region={region} url={u} "
+                    f"title={(best.get('title') or '')[:60]!r} "
+                    f"price={best.get('price')} bedrooms={best.get('bedrooms')} "
+                    f"area={(best.get('area') or '')[:30]!r} "
+                    f"sqft={best.get('size_sqft')} bath={best.get('bathrooms')} "
+                    f"desc_len={len(best.get('description') or '')}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            if enforce_mandatory and not _is_complete(best):
+                missing = [f for f in MANDATORY_FIELDS if not best.get(f)]
+                print(f"[scrape] DROP_INCOMPLETE url={u} missing={missing}", flush=True)
                 return None
+            return best
 
         slice_n = len(listing_urls) if BUDGET.enabled else (target_count + 20)
         tasks: List[asyncio.Task] = [
@@ -1141,6 +1215,8 @@ async def scrape_region_type(
                 row = await coro
                 if row and row.get("canonical_url"):
                     collected.append(row)
+                else:
+                    dropped_incomplete += 1
                 if not BUDGET.enabled and len(collected) >= target_count:
                     break
         finally:
@@ -1151,6 +1227,15 @@ async def scrape_region_type(
                 await asyncio.gather(*pending, return_exceptions=True)
     finally:
         if _owned:
-            await _client.aclose()
+            # curl_cffi AsyncSession exposes .close(), not .aclose() (httpx API).
+            try:
+                await _client.close()
+            except Exception:
+                pass
 
+    print(
+        f"[scrape] DONE region={region} type={type_key} kept={len(collected)} "
+        f"dropped_or_failed={dropped_incomplete} list_urls={len(listing_urls)}",
+        flush=True,
+    )
     return collected

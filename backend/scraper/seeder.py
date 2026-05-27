@@ -143,12 +143,18 @@ async def _scrape_one_type_persist(
     filters: Optional[Dict] = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> int:
-    """Scrape one type, persist into long-term CSV AND session tempo. Returns rows scraped.
+    """Scrape one type for REALTIME mode. Persists rows into the per-session
+    tempo JSON ONLY.
 
-    `client` (optional) is the shared httpx.AsyncClient owned by the caller
-    (run-wide). When provided, scrape_region_type reuses its connection pool
-    instead of opening a fresh one per (region, type) — the dominant TCP+TLS
-    handshake cost is paid once for the whole run.
+    Per user spec: realtime mode MUST NOT write to the long-term CSV — the
+    long-term store is owned exclusively by pure_fetch (bulk refresh) and
+    by the legacy `ensure_region` seeder. Realtime is brief-driven and may
+    carry filters that would pollute the long-term store with non-canonical
+    rows.
+
+    `client` is the shared HTTP client owned by the caller (reused across
+    every (region, type) scrape so connection pool + TLS session survive
+    the whole run).
     """
     try:
         rows = await scrape_region_type(
@@ -159,7 +165,7 @@ async def _scrape_one_type_persist(
         return 0
     if not rows:
         return 0
-    storage.append_longterm(region, rows)
+    # Tempo only — long-term CSV is OFF-LIMITS for realtime mode.
     storage.append_tempo(region, session_id, rows)
     return len(rows)
 
@@ -246,12 +252,15 @@ async def fetch_realtime_into_tempo(
             )
             total_new = sum(r for r in results if isinstance(r, int))
 
-            # Re-snapshot tempo to the freshest union (CSV is authoritative).
-            rows = storage.load_longterm(region)
-            storage.write_tempo(region, session_id, rows)
+            # Tempo is now the union of (long-term pre-seed written above) +
+            # (freshly scraped rows that _scrape_one_type_persist appended via
+            # storage.append_tempo). We must NOT re-snapshot from long-term —
+            # realtime no longer writes long-term, so doing so would discard
+            # every fresh row we just appended.
+            rows = storage.read_tempo(region, session_id)
             counts[region] = len(rows)
             logger.info(
-                "[realtime] %s: +%d new, total=%d, budget_remaining=%d, filter=%s",
+                "[realtime] %s: +%d new, tempo_total=%d, budget_remaining=%d, filter=%s",
                 region, total_new, len(rows), _URL_BUDGET.remaining, live_filter,
             )
     finally:
@@ -259,7 +268,8 @@ async def fetch_realtime_into_tempo(
         # never accidentally throttled by leftover state.
         _URL_BUDGET.disable()
         try:
-            await shared_client.aclose()
+            # curl_cffi AsyncSession exposes .close(), not .aclose().
+            await shared_client.close()
         except Exception:
             pass
 
@@ -346,7 +356,7 @@ async def fetch_pure_into_longterm(
         await asyncio.gather(*[_do_region(r) for r in regions], return_exceptions=True)
     finally:
         try:
-            await shared_client.aclose()
+            await shared_client.close()
         except Exception:
             pass
     return counts
