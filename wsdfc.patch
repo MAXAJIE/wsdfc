@@ -1,0 +1,132 @@
+--- a/backend/llm_client.py	2026-05-27 01:19:32.829671776 +0000
++++ b/backend/llm_client.py	2026-05-27 01:21:59.981361954 +0000
+@@ -246,6 +246,18 @@
+             "24h_security": "needs_security",
+             "24h security": "needs_security",
+             "24h_secure": "needs_security",
++            "guardhouse": "needs_security",
++            "guard_house": "needs_security",
++            "gate_house": "needs_security",
++            "security_guard": "needs_security",
++            "cctv": "needs_security",
++            "patrol": "needs_security",
++            "gated": "needs_gated",
++            "gated_community": "needs_gated",
++            "guarded": "needs_gated",
++            "guarded_community": "needs_gated",
++            "covered_carpark": "needs_covered_parking",
++            "indoor_parking": "needs_covered_parking",
+             "mrt": "needs_near_mrt",
+             "lrt": "needs_near_lrt",
+             "transit": "needs_near_mrt",
+@@ -264,6 +276,11 @@
+             "elevator": "needs_lift",
+             "covered_parking": "needs_covered_parking",
+             "covered parking": "needs_covered_parking",
++            "pet": "pet_friendly",
++            "pets": "pet_friendly",
++            "pets_allowed": "pet_friendly",
++            "dog_friendly": "pet_friendly",
++            "cat_friendly": "pet_friendly",
+             # Negative (NPP)
+             "no_dog": "no_dog",
+             "no dog": "no_dog",
+@@ -277,6 +294,14 @@
+             "west facing": "west_facing",
+             "noisy": "noise_area",
+             "noise": "noise_area",
++            "noisy_area": "noise_area",
++            "noise_area": "noise_area",
++            "loud": "noise_area",
++            "no_noisy": "no_noise",
++            "no_noise_area": "no_noise",
++            "quiet_required": "no_noise",
++            "no_pet": "no_pets",
++            "no_pets": "no_pets",
+             "far_mrt": "far_from_mrt",
+             "far from mrt": "far_from_mrt",
+         }
+@@ -451,6 +476,29 @@
+         pos_mapped = self._normalize_tags_to_enum(pos, PPP_ENUM_FULL)
+         neg_mapped = self._normalize_tags_to_enum(neg, NPP_ENUM_FULL)
+ 
++        # Post-pass: rescue misclassified negatives that the LLM put under
++        # "positive". A tag whose stem starts with "no_" / "not_" /
++        # "without_" / "avoid_" / "anti_" is semantically a rejection. If
++        # its canonical form lives in NPP_ENUM_FULL, move it to negatives.
++        _reject_prefixes = ("no_", "not_", "without_", "avoid_", "anti_")
++        rescued_neg: list[str] = []
++        kept_pos: list[str] = []
++        for raw in pos:
++            low = raw.strip().lower().replace(" ", "_").replace("-", "_")
++            if any(low.startswith(p) for p in _reject_prefixes):
++                remap = self._normalize_tags_to_enum([low], NPP_ENUM_FULL)
++                if remap:
++                    rescued_neg.extend(remap)
++                    continue
++            kept_pos.append(raw)
++        if rescued_neg:
++            pos_mapped = self._normalize_tags_to_enum(kept_pos, PPP_ENUM_FULL)
++            for t in rescued_neg:
++                if t not in neg_mapped:
++                    neg_mapped.append(t)
++            print(f"[semantic_alignment] rescued neg from pos: {rescued_neg}")
++
++
+         print(f"[semantic_alignment] raw → positive={pos} negative={neg}")
+         print(f"[semantic_alignment] mapped → positive={pos_mapped} negative={neg_mapped}")
+         return {"positive": pos_mapped, "negative": neg_mapped}
+--- a/property-agent-ui/src/components/phases/ResultsBatch.tsx	2026-05-27 01:19:32.841394107 +0000
++++ b/property-agent-ui/src/components/phases/ResultsBatch.tsx	2026-05-27 01:22:14.676821425 +0000
+@@ -48,7 +48,13 @@
+     try {
+       const data = await api.nextBatch(sessionId);
+       setResults(data);
+-      setAppState("BATCH_2_DISPLAY");
++      // If the next batch came back empty (e.g. all remaining listings
++      // were filtered out or the source exhausted), don't strand the user
++      // on an empty grid — route straight to the action chooser so they
++      // can re-search with / without memory.
++      const nextLen = Array.isArray(data) ? data.length : 0;
++      if (nextLen === 0) setAppState("ACTION_REQUIRED_UI");
++      else setAppState("BATCH_2_DISPLAY");
+     } catch (e) {
+       console.warn(e);
+     }
+@@ -139,6 +145,25 @@
+         ))}
+       </div>
+ 
++      {/* Empty-batch fallback: when a batch (typically batch 2) renders
++          with zero cards, surface explicit next-step actions instead of
++          a dead screen. */}
++      {(degraded ? results : results.filter((p) => !p.is_mock)).length === 0 && (
++        <div className="mt-10 flex flex-col items-center gap-4 rounded-2xl border border-dashed border-border bg-surface/40 p-8 text-center">
++          <p className="max-w-md text-sm text-muted-foreground">
++            {t("results.empty.hint", lang)}
++          </p>
++          <Button
++            onClick={() => setAppState("ACTION_REQUIRED_UI")}
++            className="h-10 rounded-xl bg-gradient-to-br from-primary to-primary-glow px-5 text-sm font-medium text-primary-foreground shadow-[var(--shadow-glow)]"
++          >
++            {t("results.empty.choose", lang)}
++            <ArrowRight className="ml-1.5 h-4 w-4" />
++          </Button>
++        </div>
++      )}
++
++
+       {appState === "BATCH_1_DISPLAY" && hasMore && (
+         <div className="mt-10 flex justify-center">
+           <Button
+--- a/property-agent-ui/src/lib/i18n.ts	2026-05-27 01:19:32.843471916 +0000
++++ b/property-agent-ui/src/lib/i18n.ts	2026-05-27 01:22:23.230245457 +0000
+@@ -50,6 +50,8 @@
+   "state.ACTION_REQUIRED_UI":   { en: "Choose next action",             zh: "请选择下一步操作" },
+   "state.RE_SEARCHING":         { en: "Re-running search",              zh: "重新搜索中" },
+   "state.TIER3_NO_RESULT":      { en: "Search exhausted",               zh: "搜索已穷尽" },
++  "results.empty.hint":         { en: "No new matches in this batch. You can broaden the search or pick a next step.", zh: "本批次暂无可用匹配，请选择下一步操作。" },
++  "results.empty.choose":       { en: "Choose next step",               zh: "选择下一步" },
+ 
+   // ── Phase 1 (PhaseOneForm) ───────────────────────────────────────────
+   "p1.badge": { en: "Phase 1 · structured profiling", zh: "阶段 1 · 结构化档案" },

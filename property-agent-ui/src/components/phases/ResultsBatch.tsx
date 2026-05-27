@@ -48,7 +48,13 @@ export function ResultsBatch() {
     try {
       const data = await api.nextBatch(sessionId);
       setResults(data);
-      setAppState("BATCH_2_DISPLAY");
+      // If the next batch came back empty (e.g. all remaining listings
+      // were filtered out or the source exhausted), don't strand the user
+      // on an empty grid — route straight to the action chooser so they
+      // can re-search with / without memory.
+      const nextLen = Array.isArray(data) ? data.length : 0;
+      if (nextLen === 0) setAppState("ACTION_REQUIRED_UI");
+      else setAppState("BATCH_2_DISPLAY");
     } catch (e) {
       console.warn(e);
     }
@@ -138,6 +144,25 @@ export function ResultsBatch() {
           />
         ))}
       </div>
+
+      {/* Empty-batch fallback: when a batch (typically batch 2) renders
+          with zero cards, surface explicit next-step actions instead of
+          a dead screen. */}
+      {(degraded ? results : results.filter((p) => !p.is_mock)).length === 0 && (
+        <div className="mt-10 flex flex-col items-center gap-4 rounded-2xl border border-dashed border-border bg-surface/40 p-8 text-center">
+          <p className="max-w-md text-sm text-muted-foreground">
+            {t("results.empty.hint", lang)}
+          </p>
+          <Button
+            onClick={() => setAppState("ACTION_REQUIRED_UI")}
+            className="h-10 rounded-xl bg-gradient-to-br from-primary to-primary-glow px-5 text-sm font-medium text-primary-foreground shadow-[var(--shadow-glow)]"
+          >
+            {t("results.empty.choose", lang)}
+            <ArrowRight className="ml-1.5 h-4 w-4" />
+          </Button>
+        </div>
+      )}
+
 
       {appState === "BATCH_1_DISPLAY" && hasMore && (
         <div className="mt-10 flex justify-center">

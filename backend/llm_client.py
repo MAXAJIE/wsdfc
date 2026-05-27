@@ -246,6 +246,18 @@ class LLMClient:
             "24h_security": "needs_security",
             "24h security": "needs_security",
             "24h_secure": "needs_security",
+            "guardhouse": "needs_security",
+            "guard_house": "needs_security",
+            "gate_house": "needs_security",
+            "security_guard": "needs_security",
+            "cctv": "needs_security",
+            "patrol": "needs_security",
+            "gated": "needs_gated",
+            "gated_community": "needs_gated",
+            "guarded": "needs_gated",
+            "guarded_community": "needs_gated",
+            "covered_carpark": "needs_covered_parking",
+            "indoor_parking": "needs_covered_parking",
             "mrt": "needs_near_mrt",
             "lrt": "needs_near_lrt",
             "transit": "needs_near_mrt",
@@ -264,6 +276,11 @@ class LLMClient:
             "elevator": "needs_lift",
             "covered_parking": "needs_covered_parking",
             "covered parking": "needs_covered_parking",
+            "pet": "pet_friendly",
+            "pets": "pet_friendly",
+            "pets_allowed": "pet_friendly",
+            "dog_friendly": "pet_friendly",
+            "cat_friendly": "pet_friendly",
             # Negative (NPP)
             "no_dog": "no_dog",
             "no dog": "no_dog",
@@ -277,6 +294,14 @@ class LLMClient:
             "west facing": "west_facing",
             "noisy": "noise_area",
             "noise": "noise_area",
+            "noisy_area": "noise_area",
+            "noise_area": "noise_area",
+            "loud": "noise_area",
+            "no_noisy": "no_noise",
+            "no_noise_area": "no_noise",
+            "quiet_required": "no_noise",
+            "no_pet": "no_pets",
+            "no_pets": "no_pets",
             "far_mrt": "far_from_mrt",
             "far from mrt": "far_from_mrt",
         }
@@ -450,6 +475,29 @@ class LLMClient:
         # Map tags to enum keys using synonym/fuzzy matching
         pos_mapped = self._normalize_tags_to_enum(pos, PPP_ENUM_FULL)
         neg_mapped = self._normalize_tags_to_enum(neg, NPP_ENUM_FULL)
+
+        # Post-pass: rescue misclassified negatives that the LLM put under
+        # "positive". A tag whose stem starts with "no_" / "not_" /
+        # "without_" / "avoid_" / "anti_" is semantically a rejection. If
+        # its canonical form lives in NPP_ENUM_FULL, move it to negatives.
+        _reject_prefixes = ("no_", "not_", "without_", "avoid_", "anti_")
+        rescued_neg: list[str] = []
+        kept_pos: list[str] = []
+        for raw in pos:
+            low = raw.strip().lower().replace(" ", "_").replace("-", "_")
+            if any(low.startswith(p) for p in _reject_prefixes):
+                remap = self._normalize_tags_to_enum([low], NPP_ENUM_FULL)
+                if remap:
+                    rescued_neg.extend(remap)
+                    continue
+            kept_pos.append(raw)
+        if rescued_neg:
+            pos_mapped = self._normalize_tags_to_enum(kept_pos, PPP_ENUM_FULL)
+            for t in rescued_neg:
+                if t not in neg_mapped:
+                    neg_mapped.append(t)
+            print(f"[semantic_alignment] rescued neg from pos: {rescued_neg}")
+
 
         print(f"[semantic_alignment] raw → positive={pos} negative={neg}")
         print(f"[semantic_alignment] mapped → positive={pos_mapped} negative={neg_mapped}")

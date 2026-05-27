@@ -50,6 +50,8 @@ export const DICT: Dict = {
   "state.ACTION_REQUIRED_UI":   { en: "Choose next action",             zh: "请选择下一步操作" },
   "state.RE_SEARCHING":         { en: "Re-running search",              zh: "重新搜索中" },
   "state.TIER3_NO_RESULT":      { en: "Search exhausted",               zh: "搜索已穷尽" },
+  "results.empty.hint":         { en: "No new matches in this batch. You can broaden the search or pick a next step.", zh: "本批次暂无可用匹配，请选择下一步操作。" },
+  "results.empty.choose":       { en: "Choose next step",               zh: "选择下一步" },
 
   // ── Phase 1 (PhaseOneForm) ───────────────────────────────────────────
   "p1.badge": { en: "Phase 1 · structured profiling", zh: "阶段 1 · 结构化档案" },
