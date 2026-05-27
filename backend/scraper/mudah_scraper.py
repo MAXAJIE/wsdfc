@@ -125,17 +125,10 @@ async def _get(client: httpx.AsyncClient, url: str) -> str:
             r = await client.get(url, headers=_headers(), follow_redirects=True, timeout=REQUEST_TIMEOUT)
             if r.status_code in (200, 201):
                 text = r.text
-                # Anti-bot detection. Only inspect the first 5 KB and require
-                # whole-word matches — Mudah's real listing pages (~800 KB)
-                # lazy-load a `recaptcha` script tag near the bottom, which
-                # the previous `"captcha" in text.lower()` substring check
-                # flagged as a ban on every successful response (root cause
-                # of `realtime empty attempt N: empty result {region: 0}`).
                 head = text[:5000].lower()
                 if len(text) < 1500 or re.search(
-                    r"\b(captcha|are you a human|attention required|"
-                    r"just a moment|access denied)\b",
-                    head,
+                        r"\b(captcha|are you a human|attention required|just a moment|access denied)\b",
+                        head,
                 ):
                     raise ScraperBanned(f"anti-bot suspected (len={len(text)})")
                 return text
