@@ -299,6 +299,44 @@ def _norm_value(v):
     return v
 
 
+# ── Location-aware dedup ─────────────────────────────────────────────
+# A user who has already confirmed "Kuala Lumpur" via the ConflictCard
+# will often re-mention it later as an alias ("kl", "KL", "吉隆坡",
+# "klcc", "petaling jaya" …). The plain _norm_value comparison treats
+# every alias as a fresh location → another ConflictCard pops, which is
+# exactly the "asking the same question few times" friction we are
+# eliminating. This helper folds any known alias to its canonical
+# region key (re-using the scraper's REGION_ALIASES /
+# REGION_GROUP_ALIASES tables — single source of truth) so dedup
+# matches across spellings/languages.
+def _norm_location(v):
+    """Return the canonical region key for *v* (e.g. "kl" → "kuala-lumpur")
+    iff *v* unambiguously matches a known Malaysian region alias.
+    Otherwise return _norm_value(v) so unknown free-text still compares
+    equally to itself."""
+    if not isinstance(v, str):
+        return _norm_value(v)
+    t = v.strip().lower()
+    if not t:
+        return ""
+    try:
+        from scraper.pipeline import REGION_ALIASES, REGION_GROUP_ALIASES
+    except Exception:
+        return _norm_value(v)
+    # Group aliases first (e.g. "联邦直辖区" → kuala-lumpur+labuan+putrajaya);
+    # collapse to a stable sorted joined key so two equivalent group
+    # mentions compare equal.
+    for group_key, regions in REGION_GROUP_ALIASES.items():
+        if group_key.lower() in t:
+            return "group:" + ",".join(sorted(regions))
+    for region, aliases in REGION_ALIASES.items():
+        if any(a in t for a in aliases):
+            return region
+    # Unknown text: fall back to the loose string compare so the dedup
+    # check still behaves identically for non-location-like values.
+    return _norm_value(v)
+
+
 def _extract_phase2_facts(dialogue_session) -> list[str]:
     """Deterministically scan all user messages in this Phase 2 session and
     extract structured facts (bedrooms, bathrooms, location, financing,
@@ -436,6 +474,22 @@ def _build_phase2_system_prompt(dialogue_session, client_context: dict | None) -
     p1 = dialogue_session.phase1_data
     identity = (getattr(p1, "identity", "") or "").lower()
 
+    # Session-scoped overrides written by /update_requirements when the
+    # user accepted a ConflictCard. If the user already confirmed a new
+    # specific_location, that new value REPLACES the Phase 1 target /
+    # location seen by the LLM — otherwise the LLM keeps framing every
+    # subsequent location mention as "different from your original
+    # <Phase1 target>" and pops the same conflict again.
+    _overrides = getattr(dialogue_session, "confirmed_overrides", {}) or {}
+    _override_loc = _overrides.get("specific_location")
+    effective_target = _override_loc or p1.target
+    effective_location = _override_loc or (getattr(p1, "location", "") or "(未填)")
+    location_override_note = (
+        f"\n（注：target/location 已被用戶在本 session 中確認更新為 "
+        f"「{_override_loc}」，Phase 1 原值已作廢，禁止再以原值報 conflict 或重複追問。）"
+        if _override_loc else ""
+    )
+
     if identity == "investor":
         timeline_q = (
             "預計購入時間 purchase_timeline（何時計劃下訂 / 完成購入）"
@@ -495,12 +549,12 @@ def _build_phase2_system_prompt(dialogue_session, client_context: dict | None) -
 === Phase 1 已確認資料（權威，禁止重複追問）===
 - 預算 budget：{p1.budget}
 - 代理風格 agent_style：{p1.agent_style}
-- 目標 target：{p1.target}
+- 目標 target：{effective_target}{location_override_note}
 - 身份 identity：{p1.identity}
 - 性別 gender：{p1.gender}
 - 用戶自述 description：{getattr(p1, 'description', '')}
 - 房屋類型 house_type：{getattr(p1, 'house_type', '') or '(未填)'}
-- 地點 location：{getattr(p1, 'location', '') or '(未填)'}
+- 地點 location：{effective_location}
 - 隱含偏好 semantic_tags：{', '.join(p1.semantic_tags) if p1.semantic_tags else '(無)'}
 
 === 身份規則（必須遵守）===
@@ -716,11 +770,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 dialogue_session, "confirmed_overrides", {}
             ) or {}
             canon = _canon_field(llm_output.conflicting_field)
+            # Alias-aware compare for location; plain loose compare for
+            # everything else. Stops the LLM from popping a second
+            # ConflictCard when the user re-mentions an already-confirmed
+            # region under a different spelling (e.g. "kl" after
+            # confirming "Kuala Lumpur").
+            _cmp = _norm_location if canon == "specific_location" else _norm_value
             if (
                 canon
                 and canon in overrides
-                and _norm_value(overrides[canon])
-                == _norm_value(llm_output.proposed_value)
+                and _cmp(overrides[canon]) == _cmp(llm_output.proposed_value)
             ):
                 return ChatResponse(
                     status="chatting",
