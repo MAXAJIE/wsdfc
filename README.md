@@ -97,7 +97,7 @@ APP_SECRET_KEY=change-me-in-production
 
 ---
 
-### 4 — Demo mode (no API key, no scraping)
+### 4 — Demo mode (recommended for most users)
 
 In `backend/config.yaml`, set:
 
@@ -107,6 +107,27 @@ scraper:
 ```
 
 The backend serves bundled mock listings and the UI shows a degradation popup. Good for local development and UI work.
+
+---
+
+### 4b — Realtime mode (optional, not recommended)
+
+> ⚠️ **I don't have time to fully debug and optimize realtime mode — use it at your own risk. It takes a long time and may fail silently. Demo mode is strongly recommended.**
+
+If you still want to try it, set `mode: "realtime"` in `config.yaml`, and **please use Johor Bahru, Johor as your location** when testing. Other regions are not well-tested and may produce no results.
+
+Kindly check the backend console to see if it's working. A healthy scrape looks like this:
+
+```
+[scrape] list region=johor type=condo page=1 extracted=40 new=40 (running_total=40)
+[scrape] list region=johor type=condo page=2 extracted=41 new=41 (running_total=81)
+[scrape] list region=johor type=condo page=3 extracted=40 new=40 (running_total=121)
+INFO:     127.0.0.1:57881 - "GET /api/v1/search_status/... HTTP/1.1" 200 OK
+[scrape] region=johor url=https://www.mudah.my/4-beds-condo-medini-... title='4 Beds Condo Medini Iskandar Puteri' price=550000.0 bedrooms=4
+[scrape] region=johor url=https://www.mudah.my/1medini-condo-...        title='1Medini condo Iskandar puteri 1 bedroom For Sale' price=300000.0
+```
+
+If the scraper fails three consecutive times it auto-degrades to demo mode and the UI shows a popup.
 
 ---
 
@@ -136,7 +157,7 @@ npm install
 npm run dev
 ```
 
-Open **http://localhost:5173**
+Open **http://localhost:5173** in your browser.
 
 The Vite dev proxy already points to `http://localhost:8000` — no extra config needed.
 
@@ -157,24 +178,6 @@ backend\start.bat
 ```
 
 Then run the frontend separately (Step 6).
-
----
-
-## Realtime mode notes
-
-Set `mode: "realtime"` in `config.yaml` to scrape live listings.
-
-**Recommended for testing:** choose **Johor Bahru, Johor** as your location — it's the best-supported region. Scraping other regions may be slow or incomplete.
-
-Watch the backend console for scraper progress:
-
-```
-[scrape] list region=johor type=condo page=1 extracted=40 new=40 (running_total=40)
-[scrape] list region=johor type=condo page=2 extracted=41 new=41 (running_total=81)
-[scrape] region=johor url=https://www.mudah.my/... title='...' price=550000.0 bedrooms=4
-```
-
-If the scraper fails three consecutive times it auto-degrades to demo mode and the UI shows a popup.
 
 ---
 
